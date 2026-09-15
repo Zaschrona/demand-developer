@@ -2,15 +2,20 @@
 
 **Author:** Zaschrona
 
-Demand Developer lets you create new residential or workplace demand points, or expand existing ones, directly from the map. Adding Residents automatically creates matching workplace demand elsewhere; adding Workers creates matching residential demand, keeping the new demand balanced through commuter flows.
+Demand Developer lets you create new residential or workplace demand points, or expand existing ones, directly from the map. Choose where and how much demand to add, and the mod automatically creates the matching demand and commuter connections elsewhere on the map. Development costs reflect both the local demand around the area and how much you have already expanded the city.
 
 ## Features
 
 - Expand existing demand points by +200, +400, +600, +800 or +1000 Residents or Workers.
 - Create new residential or workplace demand points.
-- Adapt commuter-group sizes to the scale of nearby demand.
-- Generate new commuter links from local travel patterns without simply copying existing flows.
-- Track spending, active demand and map growth, and remove development created by the mod.
+- New points are automatically named after the nearby street and district.
+- The mod automatically balances new Residents and Workers across the map.
+- The mod automatically connects new demand using nearby travel patterns.
+- Preview development costs before building.
+- Development costs scale with local demand and overall map growth.
+- View all developed points directly on the map.
+- Check stats on spending, added demand and map growth.
+- Easily remove development created by the mod.
 
 ## Installation
 
