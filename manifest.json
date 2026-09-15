@@ -1,0 +1,13 @@
+{
+  "id": "demand-developer",
+  "name": "Demand Developer",
+  "description": "Create and expand residential or workplace demand points directly on the map, with matching commuter demand generated automatically.",
+  "version": "1.0.0",
+  "author": {
+    "name": "Zaschrona"
+  },
+  "main": "index.js",
+  "dependencies": {
+    "subway-builder": ">=1.6.0"
+  }
+}
