@@ -1,7 +1,7 @@
 (function () {
   "use strict";
 
-  const TAG = "[DemandDevelopment]";
+  const TAG = "[Demand Developer]";
   const api = window.SubwayBuilderAPI;
   if (!api) {
     console.error(`${TAG} SubwayBuilderAPI not found.`);
@@ -12,7 +12,13 @@
     STEP: 200,
     BASE_STEP_COST: 21000000,
     COST_ROUNDING: 1000000,
-    CREATE_PREMIUM: 1.30,
+    NEW_POINT_PRICE_MULTIPLIER: 1.25,
+    LAND_CONVERSION_PRICE_SURCHARGE: 0.25,
+    UNIVERSITY_PRICE_SURCHARGE: 0.5,
+    AIRPORT_PRICE_SURCHARGE: 1.5,
+    INDEPENDENT_AIRPORT_PRICE_SURCHARGE: 1.0,
+    STANDALONE_AIRPORT_CLEARANCE_M: 2000,
+    ROUTE_QUERY_CONCURRENCY: 6,
     MAP_GROWTH_PRICE_STRENGTH: 10,
 
     LOCAL_MAX_RADIUS_M: 2500,
@@ -96,11 +102,8 @@
     DONOR_POOL_CAP: 32,
     REPEAT_USE_STRENGTH: 0.5,
     EXISTING_LINK_MULTIPLIER: 0.30,
-    ACTION_REPEAT_USE_STRENGTH: 3.0,
-    NEW_POINT_ACTION_REPEAT_USE_STRENGTH: 6.0,
     NEW_POINT_MIN_LINKS: 8,
     SCORE_RANDOMNESS: 0.10,
-    MAX_LINKS: 18,
     MIN_LINKS: 3,
     DEFAULT_LINKS: 8,
     SIGNIFICANT_SHARE: 0.02,
@@ -116,10 +119,50 @@
     FALLBACK_DISTANCE_SCALE_M: 4000,
     NOVELTY_CANDIDATE_POOL: 64,
     SECONDARY_GROWTH_DAMPING: 0.6,
+
+    // Regional matching uses fixed population zones with bounded neighbor smoothing.
+    REGIONAL_ZONE_CELL_M: 5000,
+    REGIONAL_ZONE_NEIGHBOR_MASS_WEIGHT: 0.30,
+    REGIONAL_ZONE_NEIGHBOR_MASS_CAP_MULT: 1.00,
+    REGIONAL_ZONE_POPULATION_EXP: 0.50,
+    REGIONAL_ZONE_REPEAT_STRENGTH: 0.20,
+    REGIONAL_ZONE_NEIGHBOR_REPEAT_STRENGTH: 0.04,
+    REGIONAL_ZONE_DISTANCE_SCALE_M: 140000,
+    REGIONAL_ZONE_DISTANCE_EXP: 0.45,
+    REGIONAL_ENDPOINT_SPREAD_SCALE_M: 4500,
+    REGIONAL_ENDPOINT_SPREAD_EXP: 1.35,
+    REGIONAL_ENDPOINT_SPREAD_FLOOR: 0.08,
+    UNIVERSITY_REGIONAL_MASS_EXP: 0.58,
+    AIRPORT_REGIONAL_MASS_EXP: 0.72,
+    UNIVERSITY_REGION_SCALE_M: 6500,
+    UNIVERSITY_REGION_EXP: 1.65,
+    UNIVERSITY_REGION_RADIUS_M: 22000,
+    AIRPORT_REGION_SCALE_M: 12000,
+    AIRPORT_REGION_EXP: 1.20,
+    AIRPORT_REGION_RADIUS_M: 26000,
+    SPECIAL_REGION_GRID_CELL_M: 6000,
+    AIRPORT_CATCHMENT_DISTANCE_SCALE_M: 120000,
+    AIRPORT_CATCHMENT_DISTANCE_EXP: 0.72,
+    AIRPORT_MAX_CATCHMENT_M: 200000,
+    UNIVERSITY_CATCHMENT_DISTANCE_SCALE_M: 45000,
+    UNIVERSITY_CATCHMENT_DISTANCE_EXP: 1.20,
+    UNIVERSITY_MAX_CATCHMENT_M: 120000,
+    SPECIAL_WORKER_PATTERN_ROUNDS: 8,
+    UNIVERSITY_REGIONAL_SHARE: 0.50,
+    SPECIAL_MATCH_SCORE_JITTER: 0.06,
+    SPECIAL_REPEAT_USE_STRENGTH: 0.35,
+    SPECIAL_FLOW_SATURATION_UNITS: 4.0,
+    SPECIAL_FLOW_SATURATION_EXP: 0.45,
+    SPECIAL_FLOW_SHARE_STRENGTH: 1.5,
+    SPECIAL_FLOW_SHARE_BASE_FLOOR: 50,
+    COUNTERPART_SIZE_MASS_EXP: 0.35,
+    CONNECTION_MAX_SIZE: 200,
     NEW_POINT_PREFIX: "demand-dev-pt:",
     POP_PREFIX: "demand-dev-pop:",
     SOURCE_ID: "demand-developer-ui-points-v3",
     CONTEXT_LAYER_ID: "demand-developer-context-layer-v3",
+    CONNECTION_LAYER_ID: "demand-developer-review-connections-v1",
+    EXISTING_CONNECTION_LAYER_ID: "demand-developer-existing-connections-v1",
     PENDING_LAYER_ID: "demand-developer-pending-layer-v3",
     LEGACY_SOURCE_ID: "demand-developer-points",
     LEGACY_LAYER_ID: "demand-developer-points-layer",
@@ -143,7 +186,7 @@
 
   function clamp(x, lo, hi) { return Math.max(lo, Math.min(hi, x)); }
   function fmtMoney(v) {
-    if (v >= 1e9) return `$${(v / 1e9).toFixed(v >= 1e10 ? 0 : 1)}B`;
+    if (v >= 1e9) return `$${(v / 1e9).toFixed(3)}B`;
     if (v >= 1e6) {
       const m = v / 1e6;
       const text = v >= 1e8 ? m.toFixed(0) : m.toFixed(1).replace(/\.0$/, "");
@@ -183,11 +226,12 @@
 
   function newLedger() {
     return {
-      version: 3,
+      version: 5,
       seq: 1,
       pointSeq: 1,
       points: {},
       pops: {},
+      adjustments: {},
       actions: [],
       originalMapDemand: null,
     };
@@ -200,6 +244,7 @@
     const migrated = { ...base, ...source };
     migrated.points = source.points && typeof source.points === "object" ? source.points : {};
     migrated.pops = source.pops && typeof source.pops === "object" ? source.pops : {};
+    migrated.adjustments = source.adjustments && typeof source.adjustments === "object" ? source.adjustments : {};
     migrated.actions = Array.isArray(source.actions) ? source.actions.map((action) => {
       if (!action || typeof action !== "object") return action;
       const { flows, popIds, ...summary } = action;
@@ -213,8 +258,20 @@
     for (const rec of Object.values(migrated.pops)) {
       if (!rec || typeof rec !== "object") continue;
       if (!("active" in rec)) rec.active = true;
+      const legacyRuntime = {};
+      if (Number.isFinite(Number(rec.homeDepartureTime))) legacyRuntime.homeDepartureTime = Number(rec.homeDepartureTime);
+      if (Number.isFinite(Number(rec.workDepartureTime))) legacyRuntime.workDepartureTime = Number(rec.workDepartureTime);
+      if (rec.lastCommute && typeof rec.lastCommute === "object") legacyRuntime.lastCommute = rec.lastCommute;
+      if (!rec.runtimeSnapshot && Object.keys(legacyRuntime).length) rec.runtimeSnapshot = legacyRuntime;
+      delete rec.homeDepartureTime;
+      delete rec.workDepartureTime;
+      delete rec.lastCommute;
     }
-    migrated.version = 3;
+    for (const rec of Object.values(migrated.adjustments)) {
+      if (!rec || typeof rec !== "object") continue;
+      if (!("active" in rec)) rec.active = true;
+    }
+    migrated.version = 5;
     return migrated;
   }
 
@@ -232,8 +289,79 @@
     return hookName ?? liveName;
   }
 
+  function cloneLedgerState(source = ledger) {
+    const out = {
+      version: Number(source?.version) || 5,
+      seq: Number(source?.seq) || 1,
+      pointSeq: Number(source?.pointSeq) || 1,
+      points: {},
+      pops: {},
+      adjustments: {},
+      actions: [],
+      originalMapDemand: source?.originalMapDemand ?? null,
+    };
+    for (const [id, rec] of Object.entries(source?.points || {})) {
+      if (!rec || typeof rec !== "object") continue;
+      out.points[id] = {
+        ...rec,
+        location: Array.isArray(rec.location) ? [...rec.location] : rec.location,
+        residentModeShare: rec.residentModeShare ? { ...rec.residentModeShare } : rec.residentModeShare,
+        workerModeShare: rec.workerModeShare ? { ...rec.workerModeShare } : rec.workerModeShare,
+      };
+    }
+    for (const [id, rec] of Object.entries(source?.pops || {})) {
+      if (!rec || typeof rec !== "object") continue;
+      const { homeDepartureTime, workDepartureTime, lastCommute, ...clean } = rec;
+      out.pops[id] = {
+        ...clean,
+        drivingPath: rec.drivingPath,
+        runtimeSnapshot: rec.runtimeSnapshot ? cloneJsonSafe(rec.runtimeSnapshot) : undefined,
+      };
+    }
+    for (const [id, rec] of Object.entries(source?.adjustments || {})) {
+      if (rec && typeof rec === "object") out.adjustments[id] = { ...rec };
+    }
+    out.actions = (source?.actions || []).filter(Boolean).map((action) => ({ ...action }));
+    return out;
+  }
+
   let ledger = newLedger();
   let demandRevision = 0;
+  let lastPlanningDemandSignature = null;
+
+  function planningDemandSignature(dd) {
+    if (!dd?.points || !dd?.popsMap) return null;
+    let pointCount = 0, pointXor = 0, pointSum = 0;
+    const hash32 = (value) => {
+      const text = String(value);
+      let h = 2166136261;
+      for (let i = 0; i < text.length; i++) {
+        h ^= text.charCodeAt(i);
+        h = Math.imul(h, 16777619);
+      }
+      return h >>> 0;
+    };
+    for (const [id, point] of dd.points.entries()) {
+      const lon = Math.round((Number(point?.location?.[0]) || 0) * 1e6);
+      const lat = Math.round((Number(point?.location?.[1]) || 0) * 1e6);
+      const residents = Math.round(Number(point?.residents) || 0);
+      const jobs = Math.round(Number(point?.jobs) || 0);
+      const popCount = point?.popIds && typeof point.popIds !== "string" && typeof point.popIds[Symbol.iterator] === "function"
+        ? Array.from(point.popIds).length
+        : 0;
+      const h = hash32(`${id}|${lon}|${lat}|${residents}|${jobs}|${popCount}`);
+      pointCount += 1;
+      pointXor = (pointXor ^ h) >>> 0;
+      pointSum = (pointSum + h) >>> 0;
+    }
+    return `${pointCount}:${pointXor}:${pointSum}|pops:${Number(dd.popsMap.size) || 0}`;
+  }
+
+  function rememberPlanningDemandSignature(dd) {
+    lastPlanningDemandSignature = planningDemandSignature(dd);
+    return lastPlanningDemandSignature;
+  }
+
   const nearestStationsCache = new Map();
   let activeDevelopmentGroupsCache = null;
   let developmentInfoStatsCache = null;
@@ -338,10 +466,13 @@
     }
 
     const sourceVersion = Number(raw?.version || 0);
+    const needsRuntimeCleanup = !!raw?.pops && Object.values(raw.pops).some((rec) =>
+      rec && typeof rec === "object" && ("lastCommute" in rec || "homeDepartureTime" in rec || "workDepartureTime" in rec)
+    );
     ledger = migrateLedger(raw);
     loadedLedgerKey = key;
 
-    if (raw && (migratedSessionLedger || migratedFromLegacyLocalStorage || sourceVersion < 3)) {
+    if (raw && (migratedSessionLedger || migratedFromLegacyLocalStorage || sourceVersion < 5 || needsRuntimeCleanup)) {
       await saveLedger();
       if (migratedSessionLedger) {
         const markerKey = slotMigrationMarkerKey();
@@ -354,7 +485,7 @@
       if (migratedFromLegacyLocalStorage && modStorage) {
         try {
           const stored = parseLedgerCandidate(await modStorage.get(key, null));
-          if (Number(stored?.version || 0) >= 3) legacyStorage()?.removeItem?.(key);
+          if (Number(stored?.version || 0) >= 4) legacyStorage()?.removeItem?.(key);
         } catch {}
       }
     }
@@ -365,7 +496,7 @@
     clearDevelopmentSummaryCaches();
     const key = ledgerKey();
     if (!key || loadedLedgerKey !== key) return Promise.resolve(false);
-    const snapshot = JSON.parse(JSON.stringify(ledger));
+    const snapshot = cloneLedgerState();
 
     ledgerSaveChain = ledgerSaveChain.then(async () => {
       try {
@@ -470,19 +601,6 @@
     return false;
   }
 
-  function addPointPopId(point, popId) {
-    if (!point) return false;
-    const wanted = String(popId);
-    const ids = point.popIds;
-    if (Array.isArray(ids)) {
-      if (!ids.some((id) => String(id) === wanted)) ids.push(popId);
-      return true;
-    }
-    if (ids && typeof ids.add === "function") { ids.add(popId); return true; }
-    point.popIds = [popId];
-    return true;
-  }
-
   function removePointPopId(point, popId) {
     if (!point) return;
     const wanted = String(popId);
@@ -501,71 +619,106 @@
     try { return JSON.parse(JSON.stringify(value)); } catch { return undefined; }
   }
 
+  const POP_CORE_FIELDS = new Set([
+    "id", "size", "residenceId", "jobId",
+    "drivingSeconds", "drivingDistance", "drivingPath"
+  ]);
+
+  function runtimeSnapshotForPop(live) {
+    if (!live || typeof live !== "object") return null;
+    const snapshot = {};
+    for (const [key, value] of Object.entries(live)) {
+      if (POP_CORE_FIELDS.has(key)) continue;
+      const cloned = cloneJsonSafe(value);
+      if (cloned !== undefined) snapshot[key] = cloned;
+    }
+    return Object.keys(snapshot).length ? snapshot : null;
+  }
+
+  function snapshotsEqual(a, b) {
+    try { return JSON.stringify(a ?? null) === JSON.stringify(b ?? null); }
+    catch { return false; }
+  }
+
+  function hasCalculatedCommute(value) {
+    return !!value && typeof value === "object" && (
+      value.modeChoice != null ||
+      Array.isArray(value.transitPaths) ||
+      value.walking != null
+    );
+  }
+
+  function restorePopRuntimeFromRecord(live, rec) {
+    if (!live || !rec?.runtimeSnapshot || typeof rec.runtimeSnapshot !== "object") return false;
+    let changed = false;
+    for (const [key, saved] of Object.entries(rec.runtimeSnapshot)) {
+      if (POP_CORE_FIELDS.has(key)) continue;
+      if (key === "lastCommute") {
+        // Keep a freshly calculated native commute; use the saved state only as a fallback after recreation.
+        if (hasCalculatedCommute(saved) && !hasCalculatedCommute(live.lastCommute)) {
+          live.lastCommute = cloneJsonSafe(saved);
+          changed = true;
+        }
+        continue;
+      }
+      if (key === "homeDepartureTime" || key === "workDepartureTime") {
+        if (Number.isFinite(Number(saved)) && Number(live[key]) !== Number(saved)) {
+          live[key] = Number(saved);
+          changed = true;
+        }
+        continue;
+      }
+      if (!snapshotsEqual(live[key], saved)) {
+        live[key] = cloneJsonSafe(saved);
+        changed = true;
+      }
+    }
+    return changed;
+  }
+
+  function restoreOwnedPopRuntimeSnapshots(dd = api.gameState.getDemandData?.()) {
+    if (!dd?.popsMap) return 0;
+    let restored = 0;
+    for (const [ledgerId, rec] of Object.entries(ledger.pops || {})) {
+      if (!rec || rec.active === false || !rec.runtimeSnapshot) continue;
+      const key = looseMapKey(dd.popsMap, ledgerId);
+      if (key == null) continue;
+      const live = dd.popsMap.get(key);
+      if (!live) continue;
+      if (String(live.residenceId ?? "") !== String(rec.residenceId ?? "") ||
+          String(live.jobId ?? "") !== String(rec.jobId ?? "")) continue;
+      if (restorePopRuntimeFromRecord(live, rec)) restored++;
+    }
+    return restored;
+  }
+
   function capturePopRuntimeIntoRecord(rec, live) {
     if (!rec || !live) return false;
-    const before = JSON.stringify([
-      rec.drivingDistance ?? null, rec.drivingSeconds ?? null,
-      rec.homeDepartureTime ?? null, rec.workDepartureTime ?? null,
-      rec.drivingPath ?? null, rec.lastCommute ?? null
-    ]);
+    let changed = false;
     const distance = Number(live.drivingDistance);
     const seconds = Number(live.drivingSeconds);
-    const home = Number(live.homeDepartureTime);
-    const work = Number(live.workDepartureTime);
-    if (Number.isFinite(distance) && distance > 0) rec.drivingDistance = distance;
-    if (Number.isFinite(seconds) && seconds > 0) rec.drivingSeconds = seconds;
-    if (Number.isFinite(home)) rec.homeDepartureTime = home;
-    if (Number.isFinite(work)) rec.workDepartureTime = work;
-    const path = cloneJsonSafe(live.drivingPath);
-    if (path !== undefined) rec.drivingPath = path;
-    const last = cloneJsonSafe(live.lastCommute);
-    if (last !== undefined) rec.lastCommute = last;
-    return before !== JSON.stringify([
-      rec.drivingDistance ?? null, rec.drivingSeconds ?? null,
-      rec.homeDepartureTime ?? null, rec.workDepartureTime ?? null,
-      rec.drivingPath ?? null, rec.lastCommute ?? null
-    ]);
-  }
-
-  function fallbackDepartureTimes(popId) {
-    const a = mixedDeterministicUnit(`${popId}:home`);
-    const b = mixedDeterministicUnit(`${popId}:work`);
-    return {
-      homeDepartureTime: Math.floor((6.5 + 3.5 * a) * 3600),
-      workDepartureTime: Math.floor((15.5 + 4.5 * b) * 3600),
-    };
-  }
-
-  function materializeLedgerPop(dd, popId, rec) {
-    const res = looseMapGet(dd?.points, rec?.residenceId);
-    const job = looseMapGet(dd?.points, rec?.jobId);
-    if (!dd?.popsMap || !res || !job || !rec || !(Number(rec.size) > 0)) return false;
-    const id = String(popId);
-    const fallback = fallbackDepartureTimes(id);
-    const pop = {
-      id,
-      size: Number(rec.size),
-      residenceId: rec.residenceId,
-      jobId: rec.jobId,
-      drivingDistance: Number(rec.drivingDistance) || 0,
-      drivingSeconds: Number(rec.drivingSeconds) || 0,
-      homeDepartureTime: Number.isFinite(Number(rec.homeDepartureTime)) ? Number(rec.homeDepartureTime) : fallback.homeDepartureTime,
-      workDepartureTime: Number.isFinite(Number(rec.workDepartureTime)) ? Number(rec.workDepartureTime) : fallback.workDepartureTime,
-    };
-    if (Array.isArray(rec.drivingPath)) pop.drivingPath = cloneJsonSafe(rec.drivingPath);
-    if (rec.lastCommute && typeof rec.lastCommute === "object") {
-      pop.lastCommute = cloneJsonSafe(rec.lastCommute);
-    } else {
-      pop.lastCommute = {
-        modeChoice: { walking: 0, driving: 0, transit: 0, unknown: Number(rec.size) || 0 },
-        transitPaths: [],
-        walking: { time: 0, distance: 0 },
-      };
+    if (Number.isFinite(distance) && distance > 0 && Number(rec.drivingDistance) !== distance) {
+      rec.drivingDistance = distance;
+      changed = true;
     }
-    dd.popsMap.set(id, pop);
-    addPointPopId(res, id);
-    if (String(rec.jobId) !== String(rec.residenceId)) addPointPopId(job, id);
-    return true;
+    if (Number.isFinite(seconds) && seconds > 0 && Number(rec.drivingSeconds) !== seconds) {
+      rec.drivingSeconds = seconds;
+      changed = true;
+    }
+    if (!validRoutePath(rec.drivingPath) && validRoutePath(live.drivingPath)) {
+      rec.drivingPath = cloneJsonSafe(live.drivingPath);
+      changed = true;
+    }
+    const runtimeSnapshot = runtimeSnapshotForPop(live);
+    if (!snapshotsEqual(rec.runtimeSnapshot, runtimeSnapshot)) {
+      if (runtimeSnapshot) rec.runtimeSnapshot = runtimeSnapshot;
+      else delete rec.runtimeSnapshot;
+      changed = true;
+    }
+    delete rec.homeDepartureTime;
+    delete rec.workDepartureTime;
+    delete rec.lastCommute;
+    return changed;
   }
 
   function detachLedgerPopObject(dd, popId, rec) {
@@ -592,16 +745,27 @@
     return changed;
   }
 
-  function liveOwnedPopIsComplete(dd, popId, rec) {
+  function liveOwnedPopBaseIsPresent(dd, popId, rec) {
     if (!dd?.points || !dd?.popsMap || !rec) return false;
     const key = looseMapKey(dd.popsMap, popId);
     if (key == null) return false;
     const live = dd.popsMap.get(key);
-    if (!popMatchesLedgerRecord(live, rec)) return false;
+    const endpointsMatch = !!live &&
+      String(live.residenceId ?? "") === String(rec.residenceId ?? "") &&
+      String(live.jobId ?? "") === String(rec.jobId ?? "");
+    const baseSizePresent = !!live && (Number(live.size) || 0) + 0.001 >= (Number(rec.size) || 0);
+    if (!endpointsMatch || !baseSizePresent) return false;
     const residence = looseMapGet(dd.points, rec.residenceId);
     const job = looseMapGet(dd.points, rec.jobId);
     if (!residence || !job) return false;
     return pointHasPopId(residence, key) && pointHasPopId(job, key);
+  }
+
+  function liveOwnedPopIsComplete(dd, popId, rec) {
+    if (!liveOwnedPopBaseIsPresent(dd, popId, rec)) return false;
+    const key = looseMapKey(dd.popsMap, popId);
+    const live = key == null ? null : dd.popsMap.get(key);
+    return popMatchesLedgerRecord(live, rec, popId);
   }
 
   function ledgerNeedsLiveRestore(dd = api.gameState.getDemandData?.()) {
@@ -610,13 +774,22 @@
       if (!rec || rec.active === false || !(Number(rec.size) > 0)) continue;
       if (!liveOwnedPopIsComplete(dd, popId, rec)) return true;
     }
+    for (const g of activeAdjustmentGroups().values()) {
+      const pop = looseMapGet(dd.popsMap, g.popId);
+      if (!pop || String(pop.residenceId) !== String(g.residenceId) || String(pop.jobId) !== String(g.jobId)) return true;
+      if (!Number.isFinite(g.beforeSize)) return true;
+      const expected = g.beforeSize + g.delta;
+      if ((Number(pop.size) || 0) + 0.001 < expected) return true;
+    }
+    const activeEndpointIds = new Set();
+    for (const pop of Object.values(ledger.pops || {})) {
+      if (!pop || pop.active === false) continue;
+      activeEndpointIds.add(String(pop.residenceId));
+      activeEndpointIds.add(String(pop.jobId));
+    }
     for (const [pointId, rec] of Object.entries(ledger.points || {})) {
-      if (!rec?.created) continue;
-      const ownsActiveDemand = Object.values(ledger.pops || {}).some((pop) =>
-        pop && pop.active !== false &&
-        (String(pop.residenceId) === String(pointId) || String(pop.jobId) === String(pointId))
-      );
-      if (ownsActiveDemand && looseMapKey(dd.points, pointId) == null) return true;
+      if (!rec?.created || !activeEndpointIds.has(String(pointId))) continue;
+      if (looseMapKey(dd.points, pointId) == null) return true;
     }
     return false;
   }
@@ -656,7 +829,11 @@
     for (const [id, p] of dd.points) {
       points.set(id, { ...p, popIds: [...(p.popIds || [])] });
     }
-    return { points, popsMap: new Map(dd.popsMap) };
+    const popsMap = new Map();
+    for (const [id, pop] of dd.popsMap) {
+      popsMap.set(id, { ...pop });
+    }
+    return { points, popsMap };
   }
 
   const DEFAULT_DRIVING_BANDS = [
@@ -686,6 +863,14 @@
       bands[idx < 0 ? bands.length - 1 : idx].push({ detour, speed });
     }
     return bands;
+  }
+  let drivingDonorCacheRevision = -1;
+  let drivingDonorCache = null;
+  function drivingDonorsForPlanning(dd) {
+    if (drivingDonorCacheRevision === demandRevision && drivingDonorCache) return drivingDonorCache;
+    drivingDonorCache = buildDrivingDonors(dd);
+    drivingDonorCacheRevision = demandRevision;
+    return drivingDonorCache;
   }
   function deterministicUnit(seed) {
     let h = 2166136261;
@@ -751,6 +936,18 @@
     return true;
   }
 
+  function increasePlannedPop(dd, popId, amount) {
+    const pop = looseMapGet(dd?.popsMap, popId);
+    if (!pop || !(Number(amount) > 0)) return false;
+    const res = looseMapGet(dd?.points, pop.residenceId);
+    const job = looseMapGet(dd?.points, pop.jobId);
+    if (!res || !job) return false;
+    pop.size = (Number(pop.size) || 0) + amount;
+    res.residents = (Number(res.residents) || 0) + amount;
+    job.jobs = (Number(job.jobs) || 0) + amount;
+    return true;
+  }
+
   function allocateInteger(weights, total, caps) {
     const n = weights.length;
     const result = new Array(n).fill(0);
@@ -802,7 +999,7 @@
     if (rows.length > limit) rows.pop();
   }
 
-  function collectSameSideDonorDescriptors(dd, location, side, targetId) {
+  function collectSameSideDonorDescriptors(dd, location, side) {
     const rows = [];
     for (const p of dd.points.values()) {
       const mass = sideMass(p, side);
@@ -856,7 +1053,7 @@
     const significant = shares.filter((x) => x.people >= CFG.SIGNIFICANT_PEOPLE && x.share >= CFG.SIGNIFICANT_SHARE);
     const count = significant.length || Math.min(shares.length, 1);
     const maxShare = shares[0]?.share || 1;
-    return { total, shares, count, maxShare };
+    return { shares, count, maxShare };
   }
 
   function weightedQuantile(rows, q) {
@@ -905,19 +1102,14 @@
     }
 
     if (!samples.length) {
-      return { typicalSize: CFG.STEP / CFG.DEFAULT_LINKS, q25: 0, q75: 0, stepAlignedShare: 0, sampleCount: 0 };
+      return CFG.STEP / CFG.DEFAULT_LINKS;
     }
 
     const median = weightedQuantile(samples, 0.5);
-    const q25 = weightedQuantile(samples, 0.25);
-    const q75 = weightedQuantile(samples, 0.75);
     const stepAlignedShare = totalWeight > 0 ? stepAlignedWeight / totalWeight : 0;
-
-    const typicalSize = stepAlignedShare >= 0.70
+    return stepAlignedShare >= 0.70
       ? CFG.STEP
       : clamp(median || CFG.STEP / CFG.DEFAULT_LINKS, CFG.MIN_FLOW, CFG.STEP);
-
-    return { typicalSize, q25, q75, stepAlignedShare, sampleCount: samples.length };
   }
 
   function ledgerGrowthDamping(pointId, oppositeSide, dd) {
@@ -939,8 +1131,14 @@
       const other = primarySide === "residential" ? String(pop.jobId) : String(pop.residenceId);
       uses.set(other, (uses.get(other) || 0) + 1);
     }
+    for (const adj of Object.values(ledger.adjustments || {})) {
+      if (!adj || adj.active === false || String(adj.primaryId || "") !== primary || adj.primarySide !== primarySide) continue;
+      const other = primarySide === "residential" ? String(adj.jobId) : String(adj.residenceId);
+      uses.set(other, (uses.get(other) || 0) + 1);
+    }
     return uses;
   }
+
 
   function repetitionMultiplierFromIndex(useIndex, counterpartId) {
     const uses = useIndex?.get(String(counterpartId)) || 0;
@@ -965,23 +1163,598 @@
     return out;
   }
 
-  function actionRepetitionMultiplier(ctx, counterpartId) {
-    const uses = ctx?.actionUseIndex?.get(String(counterpartId)) || 0;
-    if (!uses) return 1;
-    const strength = ctx?.isCreate ? CFG.NEW_POINT_ACTION_REPEAT_USE_STRENGTH : CFG.ACTION_REPEAT_USE_STRENGTH;
-    return 1 / (1 + strength * uses);
+  function buildSpecialNetworkRegionalContext(dd, kind) {
+    // Count each unique pair once and keep AIR/UNI coverage histories separate.
+    const out = [];
+    const seenPairs = new Set();
+    for (const pop of dd?.popsMap?.values?.() || []) {
+      if (!pop || !(Number(pop.size) > 0)) continue;
+      const residenceId = String(pop.residenceId || "");
+      const jobId = String(pop.jobId || "");
+      if (!residenceId || !jobId || specialPointKind(jobId) !== kind) continue;
+      const pairKey = `${residenceId}|${jobId}`;
+      if (seenPairs.has(pairKey)) continue;
+      const residence = looseMapGet(dd?.points, residenceId);
+      if (!residence || !(Number(residence.residents) > 0) || !Array.isArray(residence.location)) continue;
+      seenPairs.add(pairKey);
+      out.push({ id: residenceId, jobId, location: residence.location });
+    }
+    return out;
   }
 
   function existingLinkMultiplier(ctx, counterpartId) {
     return ctx?.existingCounterparts?.has(String(counterpartId)) ? CFG.EXISTING_LINK_MULTIPLIER : 1;
   }
 
+  function specialRegionalKernel(kind, distance) {
+    const university = kind === "university";
+    const scale = university ? CFG.UNIVERSITY_REGION_SCALE_M : CFG.AIRPORT_REGION_SCALE_M;
+    const exp = university ? CFG.UNIVERSITY_REGION_EXP : CFG.AIRPORT_REGION_EXP;
+    return 1 / Math.pow(1 + Math.max(0, distance) / scale, exp);
+  }
+
+  function buildSpecialRegionalPotentialIndex(dd, kind) {
+    const residential = [];
+    let latSum = 0;
+    for (const point of dd?.points?.values?.() || []) {
+      const residents = Math.max(0, Number(point?.residents) || 0);
+      if (!(residents > 0) || !Array.isArray(point?.location)) continue;
+      const lon = Number(point.location[0]);
+      const lat = Number(point.location[1]);
+      if (!Number.isFinite(lon) || !Number.isFinite(lat)) continue;
+      residential.push({ id: String(point.id), residents, lon, lat });
+      latSum += lat;
+    }
+    const out = new Map();
+    if (!residential.length) return out;
+
+    const refLat = toRad(latSum / residential.length);
+    const metersPerDegLat = 111320;
+    const metersPerDegLon = Math.max(1000, 111320 * Math.cos(refLat));
+    const cellSize = CFG.SPECIAL_REGION_GRID_CELL_M;
+    const radius = kind === "university" ? CFG.UNIVERSITY_REGION_RADIUS_M : CFG.AIRPORT_REGION_RADIUS_M;
+    const reach = Math.ceil(radius / cellSize);
+    const gridMass = new Map();
+    const gridKey = (x, y) => `${x}:${y}`;
+
+    for (const point of residential) {
+      point.x = point.lon * metersPerDegLon;
+      point.y = point.lat * metersPerDegLat;
+      point.gx = Math.floor(point.x / cellSize);
+      point.gy = Math.floor(point.y / cellSize);
+      const key = gridKey(point.gx, point.gy);
+      gridMass.set(key, (gridMass.get(key) || 0) + point.residents);
+    }
+
+    for (const candidate of residential) {
+      let regionalMass = 0;
+      for (let dx = -reach; dx <= reach; dx++) for (let dy = -reach; dy <= reach; dy++) {
+        const mass = gridMass.get(gridKey(candidate.gx + dx, candidate.gy + dy));
+        if (!(mass > 0)) continue;
+        let distance = 0;
+        if (dx !== 0 || dy !== 0) {
+          const cx = (candidate.gx + dx + 0.5) * cellSize;
+          const cy = (candidate.gy + dy + 0.5) * cellSize;
+          distance = Math.hypot(cx - candidate.x, cy - candidate.y);
+          if (distance > radius) continue;
+        }
+        regionalMass += mass * specialRegionalKernel(kind, distance);
+      }
+      const massExp = kind === "airport" ? CFG.AIRPORT_REGIONAL_MASS_EXP : CFG.UNIVERSITY_REGIONAL_MASS_EXP;
+      out.set(candidate.id, Math.pow(Math.max(1, regionalMass), massExp));
+    }
+    return out;
+  }
+
+  const specialRegionalPotentialCache = new Map();
+  function specialRegionalPotentialForPlanning(dd, kind) {
+    const key = `${demandRevision}|${kind || "normal"}`;
+    const cached = specialRegionalPotentialCache.get(key);
+    if (cached) return cached;
+    const value = buildSpecialRegionalPotentialIndex(dd, kind);
+    specialRegionalPotentialCache.set(key, value);
+    return value;
+  }
+
+  function specialExistingFlowStats(dd, targetId, residenceId) {
+    return connectionExistingFlowStats(dd, targetId, "work", residenceId);
+  }
+
+  function specialConnectionDamping(dd, targetId, residenceId, residents, useIndex = null) {
+    const existingFlow = specialExistingFlowStats(dd, targetId, residenceId).totalSize;
+    const units = existingFlow / Math.max(1, CFG.STEP);
+    const flowDamp = 1 / Math.pow(1 + units / CFG.SPECIAL_FLOW_SATURATION_UNITS, CFG.SPECIAL_FLOW_SATURATION_EXP);
+    const share = existingFlow / Math.max(CFG.SPECIAL_FLOW_SHARE_BASE_FLOOR, Number(residents) || 0);
+    const shareDamp = 1 / (1 + CFG.SPECIAL_FLOW_SHARE_STRENGTH * share);
+    const uses = useIndex?.get(String(residenceId)) || 0;
+    const repeatDamp = 1 / (1 + CFG.SPECIAL_REPEAT_USE_STRENGTH * uses);
+    return flowDamp * shareDamp * repeatDamp;
+  }
+
+
+  function specialMaxCatchmentDistance(kind) {
+    return kind === "airport" ? CFG.AIRPORT_MAX_CATCHMENT_M : CFG.UNIVERSITY_MAX_CATCHMENT_M;
+  }
+
+  function specialCatchmentDistanceWeight(kind, distance) {
+    const maxDistance = specialMaxCatchmentDistance(kind);
+    if (Math.max(0, distance) > maxDistance) return 0;
+    const airport = kind === "airport";
+    const scale = airport ? CFG.AIRPORT_CATCHMENT_DISTANCE_SCALE_M : CFG.UNIVERSITY_CATCHMENT_DISTANCE_SCALE_M;
+    const exp = airport ? CFG.AIRPORT_CATCHMENT_DISTANCE_EXP : CFG.UNIVERSITY_CATCHMENT_DISTANCE_EXP;
+    return 1 / Math.pow(1 + Math.max(0, distance) / scale, exp);
+  }
+
+  function regularPatternProfile(dd, location, targetId, seed, context = null) {
+    const workerCtx = createSecondaryContext(dd, location, "work", targetId, {
+      isCreate: !!context?.isCreate,
+      specialKind: null,
+    });
+    return buildSecondaryProfile(dd, location, "work", targetId, `${seed}:regular-pattern-size`, workerCtx);
+  }
+
+  function regularPatternConnectionCount(profile) {
+    if (profile?.ok && Array.isArray(profile.flows) && profile.flows.length) return profile.flows.length;
+    return 1;
+  }
+
+  function naturalActionFlowCap(profile) {
+    if (!profile?.ok || !Array.isArray(profile.flows) || !profile.flows.length) return CFG.CONNECTION_MAX_SIZE;
+    const maxFlow = Math.max(...profile.flows.map((flow) => Math.max(0, Number(flow?.size) || 0)));
+    return clamp(Math.ceil(maxFlow || CFG.CONNECTION_MAX_SIZE), CFG.MIN_FLOW, CFG.CONNECTION_MAX_SIZE);
+  }
+
+  function regionalZoneDistanceWeight(distance) {
+    return 1 / Math.pow(
+      1 + Math.max(0, distance) / CFG.REGIONAL_ZONE_DISTANCE_SCALE_M,
+      CFG.REGIONAL_ZONE_DISTANCE_EXP
+    );
+  }
+
+  function regionalEndpointSpreadWeight(row, alreadySelected) {
+    if (!alreadySelected?.length) return 1;
+    let minDistance = Infinity;
+    for (const picked of alreadySelected) {
+      if (!Array.isArray(picked?.location) || !Array.isArray(row?.location)) continue;
+      minDistance = Math.min(minDistance, haversine(row.location, picked.location));
+    }
+    if (!Number.isFinite(minDistance)) return 1;
+    const scaled = Math.max(0, minDistance) / Math.max(1, CFG.REGIONAL_ENDPOINT_SPREAD_SCALE_M);
+    const spread = 1 - Math.exp(-Math.pow(scaled, CFG.REGIONAL_ENDPOINT_SPREAD_EXP));
+    return CFG.REGIONAL_ENDPOINT_SPREAD_FLOOR
+      + (1 - CFG.REGIONAL_ENDPOINT_SPREAD_FLOOR) * clamp(spread, 0, 1);
+  }
+
+  function regionalRankScore(row) {
+    return Math.max(1e-12, Number(row?.regionalRankScore ?? row?.rankScore) || 0);
+  }
+
+  function pickRegionalSpreadCandidate(candidates, alreadySelected, seed, pickIndex = 0) {
+    if (!candidates.length) return null;
+    const maxResidents = Math.max(1, ...candidates.map((row) => Math.max(1, Number(row.residents) || 0)));
+    const maxRank = Math.max(1e-12, ...candidates.map((row) => regionalRankScore(row)));
+    let best = null;
+    let bestScore = -Infinity;
+    for (const row of candidates) {
+      const residentQuality = Math.sqrt(Math.max(1, Number(row.residents) || 0) / maxResidents);
+      const rankQuality = Math.pow(regionalRankScore(row) / maxRank, 0.35);
+      const quality = 0.62 * residentQuality + 0.38 * rankQuality;
+      const spread = regionalEndpointSpreadWeight(row, alreadySelected);
+      const jitter = 0.995 + 0.01 * deterministicUnit(`${seed}:airport-spread:${pickIndex}:${row.id}`);
+      const score = quality * spread * jitter;
+      if (score > bestScore + 1e-12
+        || (Math.abs(score - bestScore) <= 1e-12 && String(row.id).localeCompare(String(best?.id ?? "")) < 0)) {
+        best = row;
+        bestScore = score;
+      }
+    }
+    return best;
+  }
+
+  function regionalZoneCell(location, refLatRad) {
+    const lon = Number(location?.[0]) || 0;
+    const lat = Number(location?.[1]) || 0;
+    const metersPerDegreeLat = Math.PI * EARTH_RADIUS_M / 180;
+    const metersPerDegreeLon = metersPerDegreeLat * Math.max(0.20, Math.cos(refLatRad));
+    const x = lon * metersPerDegreeLon;
+    const y = lat * metersPerDegreeLat;
+    const size = Math.max(1000, CFG.REGIONAL_ZONE_CELL_M);
+    return [Math.floor(x / size), Math.floor(y / size)];
+  }
+
+  function regionalZoneKey(ix, iy) {
+    return `${ix}:${iy}`;
+  }
+
+  function regionalZoneNeighborKeys(ix, iy) {
+    const keys = [];
+    for (let dx = -1; dx <= 1; dx++) {
+      for (let dy = -1; dy <= 1; dy++) {
+        if (dx === 0 && dy === 0) continue;
+        keys.push(regionalZoneKey(ix + dx, iy + dy));
+      }
+    }
+    return keys;
+  }
+
+  function selectRegionalZonePool(rows, limit, seed = "", spreadContext = [], existingRegionalContext = [], options = {}) {
+    if (!rows.length || !(limit > 0)) return [];
+
+    const distanceWeight = typeof options.distanceWeight === "function" ? options.distanceWeight : regionalZoneDistanceWeight;
+    const refLatRad = toRad(rows.reduce((sum, row) => sum + (Number(row?.location?.[1]) || 0), 0) / rows.length);
+    const zones = new Map();
+
+    for (const row of rows) {
+      const [ix, iy] = regionalZoneCell(row.location, refLatRad);
+      const key = regionalZoneKey(ix, iy);
+      let zone = zones.get(key);
+      if (!zone) {
+        zone = { key, ix, iy, rows: [], mass: 0, weightedDistanceSum: 0 };
+        zones.set(key, zone);
+      }
+      const mass = Math.max(1, Number(row.counterpartMass ?? row.residents) || 0);
+      zone.rows.push(row);
+      zone.mass += mass;
+      zone.weightedDistanceSum += mass * Math.max(0, Number(row.distance) || 0);
+    }
+
+    const existingZoneHits = new Map();
+    for (const existing of existingRegionalContext || []) {
+      if (!Array.isArray(existing?.location)) continue;
+      const [ix, iy] = regionalZoneCell(existing.location, refLatRad);
+      const key = regionalZoneKey(ix, iy);
+      existingZoneHits.set(key, (existingZoneHits.get(key) || 0) + 1);
+    }
+
+    for (const zone of zones.values()) {
+      let neighborMass = 0;
+      for (const key of regionalZoneNeighborKeys(zone.ix, zone.iy)) {
+        neighborMass += (zones.get(key)?.mass || 0) * CFG.REGIONAL_ZONE_NEIGHBOR_MASS_WEIGHT;
+      }
+      const neighborCap = zone.mass * CFG.REGIONAL_ZONE_NEIGHBOR_MASS_CAP_MULT;
+      zone.localMass = Math.max(1, zone.mass + Math.min(neighborMass, neighborCap));
+      zone.distance = zone.mass > 0
+        ? zone.weightedDistanceSum / zone.mass
+        : Math.min(...zone.rows.map((row) => Math.max(0, Number(row.distance) || 0)));
+      zone.baseScore = Math.pow(zone.localMass, CFG.REGIONAL_ZONE_POPULATION_EXP)
+        * distanceWeight(zone.distance);
+      zone.selectedHits = 0;
+      zone.rows.sort((a, b) =>
+        ((a.existingFlowSize > 0) ? 1 : 0) - ((b.existingFlowSize > 0) ? 1 : 0)
+        || (Number(b.counterpartMass ?? b.residents) || 0) - (Number(a.counterpartMass ?? a.residents) || 0)
+        || regionalRankScore(b) - regionalRankScore(a)
+        || a.distance - b.distance
+        || String(a.id).localeCompare(String(b.id))
+      );
+    }
+
+    const selected = [];
+    const selectedIds = new Set();
+    const spreadSelected = Array.isArray(spreadContext) ? [...spreadContext] : [];
+    let spreadPickIndex = 0;
+    const targetCount = Math.min(Math.max(1, Math.floor(limit)), rows.length);
+
+    const hitCount = (zone) => (existingZoneHits.get(zone.key) || 0) + zone.selectedHits;
+    const neighborHitCount = (zone) => regionalZoneNeighborKeys(zone.ix, zone.iy)
+      .reduce((sum, key) => {
+        const neighbor = zones.get(key);
+        return sum + (existingZoneHits.get(key) || 0) + (neighbor?.selectedHits || 0);
+      }, 0);
+
+    while (selected.length < targetCount) {
+      let bestZone = null;
+      let bestZoneScore = -Infinity;
+
+      for (const zone of zones.values()) {
+        const hasCandidate = zone.rows.some((row) => !row.blocked && !selectedIds.has(String(row.id)));
+        if (!hasCandidate) continue;
+        const repeatDenom = 1
+          + CFG.REGIONAL_ZONE_REPEAT_STRENGTH * hitCount(zone)
+          + CFG.REGIONAL_ZONE_NEIGHBOR_REPEAT_STRENGTH * neighborHitCount(zone);
+        const jitter = 0.998 + 0.004 * deterministicUnit(`${seed}:regional-zone:${selected.length}:${zone.key}`);
+        const score = (zone.baseScore / Math.max(1, repeatDenom)) * jitter;
+        if (score > bestZoneScore + 1e-12
+          || (Math.abs(score - bestZoneScore) <= 1e-12 && String(zone.key).localeCompare(String(bestZone?.key ?? "")) < 0)) {
+          bestZone = zone;
+          bestZoneScore = score;
+        }
+      }
+
+      if (!bestZone) break;
+      const candidates = bestZone.rows.filter((row) => !row.blocked && !selectedIds.has(String(row.id)));
+      const row = pickRegionalSpreadCandidate(candidates, spreadSelected, `${seed}:zone:${bestZone.key}`, spreadPickIndex++);
+      if (!row) break;
+      selected.push(row);
+      spreadSelected.push(row);
+      selectedIds.add(String(row.id));
+      bestZone.selectedHits += 1;
+    }
+
+    return selected;
+  }
+
+  function buildWorkerPatternScoreMap(dd, location, targetId, seed, context = null) {
+    const workerCtx = createSecondaryContext(dd, location, "work", targetId, {
+      isCreate: !!context?.isCreate,
+      specialKind: null,
+    });
+    for (const id of context?.actionExcludedCounterparts || []) workerCtx.actionExcludedCounterparts.add(String(id));
+
+    const scores = new Map();
+    for (let round = 0; round < CFG.SPECIAL_WORKER_PATTERN_ROUNDS; round++) {
+      const profile = buildSecondaryProfile(dd, location, "work", targetId, `${seed}:worker-pattern:${round}`, workerCtx);
+      if (!profile?.ok || !Array.isArray(profile.flows) || !profile.flows.length) break;
+      let added = 0;
+      for (const flow of profile.flows) {
+        const id = String(flow.id);
+        if (workerCtx.actionExcludedCounterparts.has(id)) continue;
+        const score = Math.max(1e-12, Number(flow.score) || 0);
+        scores.set(id, Math.max(scores.get(id) || 0, score));
+        workerCtx.actionExcludedCounterparts.add(id);
+        added += 1;
+      }
+      if (!added) break;
+    }
+    return scores;
+  }
+
+  function buildSpecialHybridCandidateRows(dd, location, targetId, kind, seed, context = null) {
+    const potential = context?.specialRegionalPotential || specialRegionalPotentialForPlanning(dd, kind);
+    const workerScores = kind === "airport" ? new Map() : buildWorkerPatternScoreMap(dd, location, targetId, seed, context);
+    const useIndex = buildCounterpartUseIndex(targetId, "work");
+    const raw = [];
+    let maxWorker = 0;
+    let maxPopulation = 0;
+
+    for (const p of dd.points.values()) {
+      if (String(p.id) === String(targetId)) continue;
+      const residents = Math.max(0, Number(p.residents) || 0);
+      if (!(residents > 0) || !Array.isArray(p.location)) continue;
+
+      const existing = specialExistingFlowStats(dd, targetId, p.id);
+      const capacity = Math.max(0, CFG.CONNECTION_MAX_SIZE - existing.totalSize);
+      if (!(capacity > 0)) continue;
+
+      const distance = haversine(location, p.location);
+      if (distance > specialMaxCatchmentDistance(kind)) continue;
+      const regionalWeight = potential.get(String(p.id)) ?? 1;
+      const distanceWeight = specialCatchmentDistanceWeight(kind, distance);
+      const saturation = specialConnectionDamping(dd, targetId, p.id, residents, useIndex);
+      const growthDamp = ledgerGrowthDamping(p.id, "residents", dd);
+      const existingLink = existing.totalSize > 0 ? CFG.EXISTING_LINK_MULTIPLIER : 1;
+      const populationScore = Math.max(1e-12, regionalWeight * distanceWeight * saturation * growthDamp * existingLink);
+      const workerScore = Math.max(0, Number(workerScores.get(String(p.id))) || 0);
+      maxWorker = Math.max(maxWorker, workerScore);
+      maxPopulation = Math.max(maxPopulation, populationScore);
+      raw.push({
+        id: p.id,
+        location: p.location,
+        distance,
+        existingPopId: existing.popId,
+        existingFlowSize: existing.totalSize,
+        capacity,
+        residents,
+        counterpartMass: residents,
+        workerScore,
+        populationScore,
+      });
+    }
+
+    return raw.map((row) => {
+      const workerSignal = maxWorker > 0 ? row.workerScore / maxWorker : 0;
+      const populationSignal = maxPopulation > 0 ? row.populationScore / maxPopulation : 0;
+      const workerBaseScore = Math.pow(Math.max(0, workerSignal), 0.78);
+      const regionalBaseScore = Math.pow(Math.max(0, populationSignal), 0.82);
+      let score = kind === "university"
+        ? 0.5 * workerBaseScore + 0.5 * regionalBaseScore
+        : regionalBaseScore;
+
+      if (kind === "university" && workerSignal <= 0) score *= 0.34;
+      const rankJitter = 1 + CFG.SPECIAL_MATCH_SCORE_JITTER * (2 * deterministicUnit(`${seed}:special-hybrid:${kind}:${targetId}:${row.id}`) - 1);
+      const workerRankJitter = 1 + CFG.SPECIAL_MATCH_SCORE_JITTER * (2 * deterministicUnit(`${seed}:university-work:${targetId}:${row.id}`) - 1);
+      const regionalRankJitter = 1 + CFG.SPECIAL_MATCH_SCORE_JITTER * (2 * deterministicUnit(`${seed}:university-regional:${targetId}:${row.id}`) - 1);
+      return {
+        ...row,
+        workerSignal,
+        populationSignal,
+        workerBaseScore: Math.max(1e-12, workerBaseScore),
+        workerRankScore: Math.max(1e-12, workerBaseScore * workerRankJitter),
+        regionalBaseScore: Math.max(1e-12, regionalBaseScore),
+        regionalRankScore: Math.max(1e-12, regionalBaseScore * regionalRankJitter),
+        baseScore: Math.max(1e-12, score),
+        rankScore: Math.max(1e-12, score * rankJitter),
+      };
+    }).sort((a, b) => b.rankScore - a.rankScore || b.baseScore - a.baseScore || a.distance - b.distance || String(a.id).localeCompare(String(b.id)));
+  }
+
+  function selectUniversityHybridPool(rows, limit, seed, spreadExistingContext = [], existingRegionalContext = []) {
+    if (!rows.length || !(limit > 0)) return [];
+    const target = Math.min(rows.length, Math.max(1, Math.floor(limit)));
+    const regionalTarget = Math.floor(target * CFG.UNIVERSITY_REGIONAL_SHARE);
+    const workTarget = target - regionalTarget; // odd counts stay slightly more local
+
+    const workSorted = [...rows]
+      .filter((row) => Number(row.workerScore) > 0)
+      .sort((a, b) => b.workerRankScore - a.workerRankScore
+        || b.workerBaseScore - a.workerBaseScore
+        || a.distance - b.distance
+        || String(a.id).localeCompare(String(b.id)));
+
+    const selected = workSorted.slice(0, Math.min(workTarget, workSorted.length));
+    const selectedIds = new Set(selected.map((row) => String(row.id)));
+
+    const regionalCandidates = rows.filter((row) => !selectedIds.has(String(row.id)));
+    const regional = selectRegionalZonePool(regionalCandidates, regionalTarget, `${seed}:university-regional-half`, [...spreadExistingContext, ...selected], existingRegionalContext);
+    for (const row of regional) {
+      if (selectedIds.has(String(row.id))) continue;
+      selected.push(row);
+      selectedIds.add(String(row.id));
+    }
+
+    if (selected.length < target) {
+      for (const row of workSorted) {
+        if (selected.length >= target) break;
+        if (selectedIds.has(String(row.id))) continue;
+        selected.push(row);
+        selectedIds.add(String(row.id));
+      }
+    }
+    if (selected.length < target) {
+      const remaining = rows.filter((row) => !selectedIds.has(String(row.id)));
+      const extraRegional = selectRegionalZonePool(remaining, target - selected.length, `${seed}:university-regional-fill`, [...spreadExistingContext, ...selected], existingRegionalContext);
+      for (const row of extraRegional) {
+        if (selected.length >= target) break;
+        if (selectedIds.has(String(row.id))) continue;
+        selected.push(row);
+        selectedIds.add(String(row.id));
+      }
+    }
+    return selected;
+  }
+
+  function selectSpecialHybridRows(rows, kind, amount, seed, desiredConnectionCount = null, spreadExistingContext = [], existingRegionalContext = []) {
+    if (!rows.length || !(amount > 0)) return [];
+    const minimumNeeded = Math.max(1, Math.ceil(amount / CFG.CONNECTION_MAX_SIZE));
+    const candidateRows = rows;
+    const localPatternCount = Number.isFinite(desiredConnectionCount) && desiredConnectionCount > 0
+      ? Math.floor(desiredConnectionCount)
+      : 1;
+    const buildSteps = Math.max(1, Math.floor(amount / CFG.STEP));
+    const maxByMinimumFlow = Math.max(1, Math.floor(amount / CFG.MIN_FLOW));
+    const desired = Math.min(
+      candidateRows.length,
+      maxByMinimumFlow,
+      Math.max(minimumNeeded, localPatternCount * buildSteps)
+    );
+    let selected = kind === "airport"
+      ? selectRegionalZonePool(candidateRows, desired, seed, spreadExistingContext, existingRegionalContext)
+      : selectUniversityHybridPool(candidateRows, desired, seed, spreadExistingContext, existingRegionalContext);
+
+    const selectedIds = new Set(selected.map((row) => String(row.id)));
+    let capacity = selected.reduce((sum, row) => sum + row.capacity, 0);
+    if (capacity < amount) {
+      if (kind === "airport") {
+        let fillRound = 0;
+        while (capacity < amount) {
+          const remaining = rows.filter((row) => !selectedIds.has(String(row.id)));
+          if (!remaining.length) break;
+          const extra = selectRegionalZonePool(remaining, Math.min(remaining.length, Math.max(1, minimumNeeded)), `${seed}:capacity-fill:${fillRound++}`, [...spreadExistingContext, ...selected], existingRegionalContext);
+          if (!extra.length) break;
+          let added = 0;
+          for (const row of extra) {
+            const id = String(row.id);
+            if (selectedIds.has(id)) continue;
+            selected.push(row);
+            selectedIds.add(id);
+            capacity += row.capacity;
+            added += 1;
+            if (capacity >= amount) break;
+          }
+          if (!added) break;
+        }
+      } else {
+        for (const row of rows) {
+          if (capacity >= amount) break;
+          if (selectedIds.has(String(row.id))) continue;
+          selected.push(row);
+          selectedIds.add(String(row.id));
+          capacity += row.capacity;
+        }
+      }
+    }
+    return capacity >= amount ? selected : [];
+  }
+
+  function counterpartMassFactors(rows, getMass) {
+    const masses = rows.map((row) => Math.max(1, Number(getMass(row)) || 0));
+    const maxMass = Math.max(1, ...masses);
+    return masses.map((mass) => Math.pow(mass / maxMass, CFG.COUNTERPART_SIZE_MASS_EXP));
+  }
+
+  function allocateSpecialHybridFlows(rows, amount) {
+    if (!rows.length || !(amount > 0)) return [];
+    let selected = [...rows];
+    while (selected.length > 1) {
+      const minimumTotal = selected.reduce((sum, row) => sum + Math.min(CFG.MIN_FLOW, row.capacity), 0);
+      if (minimumTotal <= amount) break;
+      selected.pop();
+    }
+    if (selected.reduce((sum, row) => sum + row.capacity, 0) < amount) return [];
+
+    const minimums = selected.map((row) => Math.min(CFG.MIN_FLOW, row.capacity));
+    const minimumTotal = minimums.reduce((a, b) => a + b, 0);
+    const extraCaps = selected.map((row, i) => Math.max(0, row.capacity - minimums[i]));
+    const massFactors = counterpartMassFactors(selected, (row) => row.counterpartMass ?? row.residents);
+    const weights = selected.map((row, i) => {
+      const base = Math.sqrt(Math.max(1e-9, row.baseScore));
+      return Math.max(1e-9, base * massFactors[i]);
+    });
+    const extras = allocateInteger(weights, Math.max(0, amount - minimumTotal), extraCaps);
+    return selected.map((row, i) => ({
+      id: row.id,
+      size: minimums[i] + extras[i],
+      score: weights[i],
+      existingPopId: row.existingPopId,
+    })).filter((flow) => flow.size > 0);
+  }
+
+  function buildSpecialActionProfile(dd, location, targetId, kind, amount, seed, context = null) {
+    const totalAmount = Math.max(0, Math.floor(Number(amount) || 0));
+    if (!(totalAmount > 0) || totalAmount % CFG.STEP !== 0) return { ok: false, reason: "invalid-special-amount", flows: [] };
+
+    const regularPattern = regularPatternProfile(dd, location, targetId, seed, context);
+    const localPatternCount = regularPatternConnectionCount(regularPattern);
+    const perConnectionAddCap = naturalActionFlowCap(regularPattern);
+    const rows = buildSpecialHybridCandidateRows(dd, location, targetId, kind, seed, context)
+      .map((row) => ({ ...row, capacity: Math.min(row.capacity, perConnectionAddCap) }))
+      .filter((row) => row.capacity > 0);
+
+    const maxCatchmentDistance = specialMaxCatchmentDistance(kind);
+    const spreadExistingContext = [...buildExistingCounterpartSet(dd, targetId, "work")]
+      .map((id) => looseMapGet(dd.points, id))
+      .filter((point) => point && Array.isArray(point.location) && Number(point.residents) > 0)
+      .filter((point) => haversine(location, point.location) <= maxCatchmentDistance)
+      .map((point) => ({ id: point.id, location: point.location }));
+    const existingRegionalContext = buildSpecialNetworkRegionalContext(dd, kind)
+      .filter((row) => Array.isArray(row.location) && haversine(location, row.location) <= maxCatchmentDistance);
+    const selected = selectSpecialHybridRows(rows, kind, totalAmount, seed, localPatternCount, spreadExistingContext, existingRegionalContext);
+    if (!selected.length) return { ok: false, reason: "not-enough-special-capacity", flows: [] };
+    const flows = allocateSpecialHybridFlows(selected, totalAmount);
+    if (flows.reduce((sum, flow) => sum + flow.size, 0) !== totalAmount) {
+      return { ok: false, reason: "special-allocation-failed", flows: [] };
+    }
+
+    const ids = new Set();
+    for (const flow of flows) {
+      const id = String(flow.id);
+      if (ids.has(id)) return { ok: false, reason: "duplicate-special-counterpart", flows: [] };
+      ids.add(id);
+      const stats = specialExistingFlowStats(dd, targetId, flow.id);
+      if (stats.totalSize + flow.size > CFG.CONNECTION_MAX_SIZE) {
+        return { ok: false, reason: "special-connection-over-200", flows: [] };
+      }
+    }
+    return {
+      ok: flows.length > 0 && flows.reduce((sum, flow) => sum + flow.size, 0) === totalAmount,
+      flows,
+    };
+  }
+
   function createSecondaryContext(dd, location, primarySide, targetId, options = {}) {
-    const donorDescriptors = collectSameSideDonorDescriptors(dd, location, primarySide, targetId);
+    const specialKind = options.specialKind || null;
+    if (specialKind && primarySide === "work") {
+      return {
+        actionExcludedCounterparts: new Set(),
+        isCreate: !!options.isCreate,
+        specialKind,
+        specialRegionalPotential: specialRegionalPotentialForPlanning(dd, specialKind),
+      };
+    }
+
+    const donorDescriptors = collectSameSideDonorDescriptors(dd, location, primarySide);
     const donorProfiles = new Map();
     for (const d of donorDescriptors) {
-      if (String(d.id) === String(targetId)) continue;
-      donorProfiles.set(d.id, donorProfile(dd, d.id, primarySide));
+      if (String(d.id) !== String(targetId)) donorProfiles.set(d.id, donorProfile(dd, d.id, primarySide));
     }
     const oppositeSideName = primarySide === "residential" ? "jobs" : "residents";
     const fallback = [];
@@ -990,22 +1763,169 @@
       const mass = oppositeSideName === "jobs" ? p.jobs : p.residents;
       if (!(mass > 0)) continue;
       const distance = haversine(location, p.location);
-      fallback.push({
-        id: p.id,
-        distance,
-        distWeight: 1 / Math.pow(1 + distance / CFG.FALLBACK_DISTANCE_SCALE_M, 1.25),
-      });
+      fallback.push({ id: p.id, distWeight: 1 / Math.pow(1 + distance / CFG.FALLBACK_DISTANCE_SCALE_M, 1.25) });
     }
     return {
-      targetId: String(targetId),
-      primarySide,
       donorDescriptors,
       donorProfiles,
       fallback,
       useIndex: buildCounterpartUseIndex(targetId, primarySide),
-      actionUseIndex: new Map(),
+      actionExcludedCounterparts: new Set(),
       existingCounterparts: buildExistingCounterpartSet(dd, targetId, primarySide),
       isCreate: !!options.isCreate,
+    };
+  }
+
+  function commuterPairKey(residenceId, jobId) {
+    return `${String(residenceId)}\u0000${String(jobId)}`;
+  }
+
+  function activeCommuterPairCounts(dd) {
+    const counts = new Map();
+    for (const pop of dd?.popsMap?.values?.() || []) {
+      if (!pop || !(Number(pop.size) > 0)) continue;
+      const key = commuterPairKey(pop.residenceId, pop.jobId);
+      counts.set(key, (counts.get(key) || 0) + 1);
+    }
+    return counts;
+  }
+
+  function connectionExistingFlowStats(dd, targetId, primarySide, counterpartId) {
+    const target = looseMapGet(dd?.points, targetId);
+    if (!target) return { totalSize: 0, popId: null };
+    let totalSize = 0;
+    let bestPopId = null;
+    let bestSize = 0;
+    for (const popId of target.popIds || []) {
+      const pop = looseMapGet(dd?.popsMap, popId);
+      if (!pop || !(Number(pop.size) > 0)) continue;
+      const matches = primarySide === "residential"
+        ? String(pop.residenceId) === String(targetId) && String(pop.jobId) === String(counterpartId)
+        : String(pop.jobId) === String(targetId) && String(pop.residenceId) === String(counterpartId);
+      if (!matches) continue;
+      const size = Number(pop.size) || 0;
+      totalSize += size;
+      if (size > bestSize) {
+        bestSize = size;
+        bestPopId = pop.id ?? popId;
+      }
+    }
+    return { totalSize, popId: bestPopId };
+  }
+
+  function buildRegularActionProfile(dd, location, primarySide, targetId, amount, seed, ctx) {
+    if (!(amount > 0) || amount % CFG.STEP !== 0) return { ok: false, reason: "invalid-amount", flows: [] };
+    const excluded = ctx.actionExcludedCounterparts || (ctx.actionExcludedCounterparts = new Set());
+    const selected = new Map();
+    let totalCapacity = 0;
+    const buildSteps = Math.max(1, Math.floor(amount / CFG.STEP));
+    const minimumNeeded = Math.max(1, Math.ceil(amount / CFG.CONNECTION_MAX_SIZE));
+    const maxByMinimumFlow = Math.max(1, Math.floor(amount / CFG.MIN_FLOW));
+    let desiredConnections = minimumNeeded;
+    let patternCountResolved = false;
+    let perConnectionAddCap = CFG.CONNECTION_MAX_SIZE;
+    const rounds = Math.min(64, Math.max(8, buildSteps * 8));
+
+    for (let round = 0; round < rounds && (selected.size < desiredConnections || totalCapacity < amount); round++) {
+      const profile = buildSecondaryProfile(dd, location, primarySide, targetId, `${seed}:regular-action:${round}`, ctx);
+      if (!profile.ok) break;
+      if (!patternCountResolved) {
+        const localPatternCount = Math.max(1, profile.flows.length);
+        desiredConnections = Math.min(
+          maxByMinimumFlow,
+          Math.max(minimumNeeded, localPatternCount * buildSteps)
+        );
+        perConnectionAddCap = naturalActionFlowCap(profile);
+        patternCountResolved = true;
+      }
+      let sawCandidate = false;
+      for (const flow of profile.flows) {
+        const id = String(flow.id);
+        if (excluded.has(id)) continue;
+        excluded.add(id);
+        sawCandidate = true;
+        const stats = connectionExistingFlowStats(dd, targetId, primarySide, id);
+        const capacity = Math.min(
+          Math.max(0, CFG.CONNECTION_MAX_SIZE - stats.totalSize),
+          perConnectionAddCap
+        );
+        if (!(capacity > 0)) continue;
+        const counterpart = looseMapGet(dd.points, id);
+        const counterpartMass = primarySide === "residential"
+          ? Math.max(0, Number(counterpart?.jobs) || 0)
+          : Math.max(0, Number(counterpart?.residents) || 0);
+        const row = {
+          id,
+          score: Math.max(1e-9, Number(flow.score) || 1),
+          existingPopId: stats.popId,
+          existingFlowSize: stats.totalSize,
+          capacity,
+          counterpartMass,
+        };
+        selected.set(id, row);
+        totalCapacity += capacity;
+        if (selected.size >= desiredConnections && totalCapacity >= amount) break;
+      }
+      if (!sawCandidate) break;
+    }
+
+    if (totalCapacity < amount || !selected.size) {
+      return { ok: false, reason: "not-enough-connection-capacity", flows: [] };
+    }
+
+    const localRows = [...selected.values()].sort((a, b) => b.score - a.score || String(a.id).localeCompare(String(b.id)));
+    let rows = localRows.slice(0, desiredConnections);
+    let chosenCapacity = rows.reduce((sum, row) => sum + row.capacity, 0);
+    if (chosenCapacity < amount) {
+      const rowIds = new Set(rows.map((row) => String(row.id)));
+      for (const row of localRows) {
+        if (chosenCapacity >= amount) break;
+        const id = String(row.id);
+        if (rowIds.has(id)) continue;
+        rows.push(row);
+        rowIds.add(id);
+        chosenCapacity += row.capacity;
+      }
+    }
+
+    while (rows.length > 1 && CFG.MIN_FLOW * rows.length > amount) rows.pop();
+    if (rows.reduce((sum, row) => sum + row.capacity, 0) < amount) {
+      return { ok: false, reason: "not-enough-connection-capacity", flows: [] };
+    }
+
+    const minimums = rows.map((row) => Math.min(CFG.MIN_FLOW, row.capacity));
+    let minimumTotal = minimums.reduce((a, b) => a + b, 0);
+    while (rows.length > 1 && minimumTotal > amount) {
+      rows.pop();
+      minimums.pop();
+      minimumTotal = minimums.reduce((a, b) => a + b, 0);
+    }
+    if (rows.reduce((sum, row) => sum + row.capacity, 0) < amount) {
+      return { ok: false, reason: "not-enough-connection-capacity", flows: [] };
+    }
+
+    const remaining = amount - minimumTotal;
+    const extraCaps = rows.map((row, i) => Math.max(0, row.capacity - minimums[i]));
+    const massFactors = counterpartMassFactors(rows, (row) => row.counterpartMass);
+    const weights = rows.map((row, i) => Math.max(
+      1e-9,
+      Math.sqrt(Math.max(1e-9, row.score)) * massFactors[i]
+    ));
+    const extras = allocateInteger(weights, remaining, extraCaps);
+    const flows = rows.map((row, i) => ({
+      id: row.id,
+      size: minimums[i] + extras[i],
+      score: row.score,
+      existingPopId: row.existingPopId,
+    })).filter((flow) => flow.size > 0);
+
+    const total = flows.reduce((sum, flow) => sum + flow.size, 0);
+    if (total !== amount || flows.some((flow) => flow.size > CFG.CONNECTION_MAX_SIZE)) {
+      return { ok: false, reason: "allocation-failed", flows: [] };
+    }
+    return {
+      ok: true,
+      flows,
     };
   }
 
@@ -1036,6 +1956,7 @@
       maxShareWeighted += d.weight * profile.maxShare;
       const seen = new Set();
       for (const flow of profile.shares) {
+        if (ctx.actionExcludedCounterparts?.has(String(flow.id))) continue;
         const oppositePoint = dd.points.get(flow.id);
         if (!oppositePoint) continue;
         const oppositeSide = primarySide === "residential" ? "jobs" : "residents";
@@ -1043,10 +1964,9 @@
         if (!(existingOppositeMass > 0)) continue;
         const damp = ledgerGrowthDamping(flow.id, oppositeSide, dd);
         const repeat = repetitionMultiplierFromIndex(ctx.useIndex, flow.id);
-        const actionRepeat = actionRepetitionMultiplier(ctx, flow.id);
         const existingLink = existingLinkMultiplier(ctx, flow.id);
         const jitter = 1 + CFG.SCORE_RANDOMNESS * (2 * deterministicUnit(`${variationSeed}:${targetId}:${flow.id}`) - 1);
-        const score = d.weight * flow.share * damp * repeat * actionRepeat * existingLink * jitter;
+        const score = d.weight * flow.share * damp * repeat * existingLink * jitter;
         candidateScore.set(flow.id, (candidateScore.get(flow.id) || 0) + score);
         if (!seen.has(flow.id)) {
           candidateCoverage.set(flow.id, (candidateCoverage.get(flow.id) || 0) + d.weight);
@@ -1056,10 +1976,11 @@
     }
 
     let desiredLinks = profileWeightSum > 0 ? Math.round(linkCountWeighted / profileWeightSum) : CFG.DEFAULT_LINKS;
-    desiredLinks = clamp(desiredLinks, CFG.MIN_LINKS, CFG.MAX_LINKS);
-    if (ctx.isCreate) desiredLinks = Math.min(CFG.MAX_LINKS, Math.max(desiredLinks, CFG.NEW_POINT_MIN_LINKS));
+    const naturalMaxLinks = Math.max(CFG.MIN_LINKS, Math.floor(CFG.STEP / Math.max(1, CFG.MIN_FLOW)));
+    desiredLinks = clamp(desiredLinks, CFG.MIN_LINKS, naturalMaxLinks);
+    if (ctx.isCreate) desiredLinks = Math.min(naturalMaxLinks, Math.max(desiredLinks, CFG.NEW_POINT_MIN_LINKS));
     const localMaxShare = profileWeightSum > 0 ? maxShareWeighted / profileWeightSum : 0.20;
-    const popStyle = localPopSizeProfile(dd, ctx, primarySide, targetId);
+    const typicalPopSize = localPopSizeProfile(dd, ctx, primarySide, targetId);
 
     if (profileWeightSum > 0) {
       for (const [id, score] of candidateScore) {
@@ -1072,6 +1993,7 @@
     const existing = new Set(candidateScore.keys());
     const fallback = [];
     for (const f of ctx.fallback) {
+      if (ctx.actionExcludedCounterparts?.has(String(f.id))) continue;
       if (existing.has(f.id)) continue;
       const p = dd.points.get(f.id);
       if (!p) continue;
@@ -1079,10 +2001,9 @@
       if (!(mass > 0)) continue;
       const damp = ledgerGrowthDamping(f.id, oppositeSideName, dd);
       const repeat = repetitionMultiplierFromIndex(ctx.useIndex, f.id);
-      const actionRepeat = actionRepetitionMultiplier(ctx, f.id);
       const existingLink = existingLinkMultiplier(ctx, f.id);
       const jitter = 1 + CFG.SCORE_RANDOMNESS * (2 * deterministicUnit(`${variationSeed}:fallback:${targetId}:${f.id}`) - 1);
-      fallback.push({ id: f.id, score: CFG.FALLBACK_SCORE_SCALE * Math.sqrt(mass) * f.distWeight * damp * repeat * actionRepeat * existingLink * jitter });
+      fallback.push({ id: f.id, score: CFG.FALLBACK_SCORE_SCALE * Math.sqrt(mass) * f.distWeight * damp * repeat * existingLink * jitter });
     }
     fallback.sort((a, b) => b.score - a.score || String(a.id).localeCompare(String(b.id)));
     const needCandidates = Math.max(desiredLinks, CFG.MIN_COUNTERPOINTS);
@@ -1098,11 +2019,11 @@
       .sort((a, b) => b.score - a.score || String(a.id).localeCompare(String(b.id)));
 
     if (!ranked.length) {
-      return { ok: false, reason: "not-enough-counterpoints", donors: donors.length, candidates: 0 };
+      return { ok: false, reason: "not-enough-counterpoints" };
     }
 
     const targetFlowCount = clamp(
-      Math.round(CFG.STEP / Math.max(CFG.MIN_FLOW, popStyle.typicalSize)),
+      Math.round(CFG.STEP / Math.max(CFG.MIN_FLOW, typicalPopSize)),
       1,
       Math.min(desiredLinks, ranked.length)
     );
@@ -1134,18 +2055,13 @@
         return {
           ok: true,
           flows,
-          donors: donors.length,
-          desiredLinks,
-          localMaxShare,
-          selectedLinks: flows.length,
-          popStyle,
         };
       }
       if (selected.length === minimumFlows) break;
       selected = selected.slice(0, -1);
     }
 
-    return { ok: false, reason: "allocation-failed", donors: donors.length, candidates: ranked.length };
+    return { ok: false, reason: "allocation-failed" };
   }
 
   const spatialPricingCache = new Map();
@@ -1387,10 +2303,14 @@
     return 1 + CFG.MAP_GROWTH_PRICE_STRENGTH * (growthPercent / 100);
   }
 
-  function quoteDevelopmentPrice(dd, location, amount, isCreate = false) {
+  function quoteDevelopmentPrice(dd, location, amount, isCreate = false, priceMultiplier = 1, followupMultiplier = null) {
     if (!dd || !Array.isArray(location) || !DEVELOPMENT_AMOUNTS.includes(amount)) {
       return { ok: false, totalCost: Infinity };
     }
+    const firstMultiplier = Math.max(1, Number(priceMultiplier) || 1);
+    const laterMultiplier = isCreate && followupMultiplier != null
+      ? Math.max(1, Number(followupMultiplier) || 1)
+      : firstMultiplier;
     const profile = locationMassProfile(dd, location);
     const baseDemand = originalMapDemand(dd);
     let addedDemand = activeAddedDemand();
@@ -1398,9 +2318,9 @@
     const cumulative = {};
     const steps = amount / CFG.STEP;
     for (let step = 0; step < steps; step++) {
-      const creation = isCreate && step === 0 ? CFG.CREATE_PREMIUM : 1;
       const growth = mapGrowthPriceMultiplier(addedDemand, baseDemand);
-      totalCost += roundDevelopmentCost(effectiveStepCost(profile) * creation * growth);
+      const multiplier = step === 0 ? firstMultiplier : laterMultiplier;
+      totalCost += roundDevelopmentCost(effectiveStepCost(profile) * growth * multiplier);
       cumulative[(step + 1) * CFG.STEP] = totalCost;
       addedDemand += CFG.STEP;
       profile.local += CFG.STEP;
@@ -1417,11 +2337,16 @@
   const locationProfiles = new Map();
   const locationLabelSeen = new Set();
   const locationLabels = { city: [], district: [], street: [] };
-  const locationGrids = { district: new Map(), street: new Map() };
+  const locationGrids = { city: new Map(), district: new Map(), street: new Map() };
   const LOCATION_GRID_DEG = 0.02;
   const locationZoomThresholds = { district: 11, street: 14.5 };
+  const locationStreetCache = new Map();
+  let locationLabelRevision = 0;
   let locationIndexMap = null;
   let locationIndexTimer = null;
+  let locationIndexPending = false;
+  let locationQueryDescriptorMap = null;
+  let locationQueryDescriptorsCache = null;
 
   function distanceMeters(a, b) {
     if (!Array.isArray(a) || !Array.isArray(b)) return Infinity;
@@ -1470,12 +2395,14 @@
     locationLabelSeen.add(key);
     const rec = { name, coords: [Number(coords[0]), Number(coords[1])] };
     locationLabels[kind].push(rec);
-    if (kind === "district" || kind === "street") {
+    const grid = locationGrids[kind];
+    if (grid) {
       const cell = gridCell(rec.coords);
-      const bucket = locationGrids[kind].get(cell) || [];
+      const bucket = grid.get(cell) || [];
       bucket.push(rec);
-      locationGrids[kind].set(cell, bucket);
+      grid.set(cell, bucket);
     }
+    locationLabelRevision += 1;
     return true;
   }
 
@@ -1501,7 +2428,7 @@
 
   function nearestLocationLabel(kind, location) {
     const maxMeters = kind === "street" ? 900 : kind === "district" ? 8000 : 22000;
-    const pool = kind === "city" ? locationLabels.city : nearbyGridLabels(kind, location, maxMeters);
+    const pool = nearbyGridLabels(kind, location, maxMeters);
     let best = null;
     for (const rec of pool) {
       const meters = distanceMeters(location, rec.coords);
@@ -1514,21 +2441,23 @@
   function resolveLocationProfile(location) {
     const key = locationKey(location);
     if (!key) return null;
-    const profile = locationProfiles.get(key) || { city: null, district: null, street: null };
+    const cached = locationProfiles.get(key);
+    if (cached?._revision === locationLabelRevision) return cached;
+    const profile = cached || { city: null, district: null, street: null };
     for (const kind of ["city", "district", "street"]) {
       const candidate = nearestLocationLabel(kind, location);
       if (candidate && (!profile[kind] || candidate.meters < profile[kind].meters)) profile[kind] = candidate;
     }
+    profile._revision = locationLabelRevision;
     locationProfiles.set(key, profile);
     return profile;
   }
 
-  function collectLoadedLocationLabels(map = api.utils.getMap?.()) {
-    if (!map) return false;
-    let added = false;
+  function locationQueryDescriptors(map) {
+    if (locationQueryDescriptorMap === map && locationQueryDescriptorsCache) return locationQueryDescriptorsCache;
+    const queries = new Map();
     try {
-      const style = map.getStyle?.() || {};
-      const queries = new Map();
+      const style = map?.getStyle?.() || {};
       for (const layer of style.layers || []) {
         const sourceId = layer?.source;
         const sourceLayer = layer?.["source-layer"];
@@ -1541,8 +2470,19 @@
           if (kind === "street") locationZoomThresholds.street = Math.min(locationZoomThresholds.street, minz);
         }
       }
+    } catch {}
+    locationQueryDescriptorMap = map;
+    locationQueryDescriptorsCache = [...queries.values()];
+    return locationQueryDescriptorsCache;
+  }
+
+  function collectLoadedLocationLabels(map = api.utils.getMap?.()) {
+    if (!map) return false;
+    let added = false;
+    try {
+      const queries = locationQueryDescriptors(map);
       if (map.querySourceFeatures) {
-        for (const { sourceId, sourceLayer, kind } of queries.values()) {
+        for (const { sourceId, sourceLayer, kind } of queries) {
           let fs = [];
           try { fs = map.querySourceFeatures(sourceId, { sourceLayer }) || []; } catch { continue; }
           for (const f of fs) {
@@ -1552,8 +2492,7 @@
             if (name && coords) added = addLocationLabel(kind, name, coords) || added;
           }
         }
-      }
-      if (map.queryRenderedFeatures) {
+      } else if (map.queryRenderedFeatures) {
         let fs = [];
         try { fs = map.queryRenderedFeatures() || []; } catch {}
         for (const f of fs) {
@@ -1568,29 +2507,30 @@
     return added;
   }
 
-  function seedDemandLocationProfiles() {
-    const dd = api.gameState.getDemandData?.();
-    if (!dd?.points) return;
-    for (const p of dd.points.values()) if (Array.isArray(p?.location)) resolveLocationProfile(p.location);
-  }
-
   function refreshLocationIndex() {
-    const added = collectLoadedLocationLabels();
-    if (added) seedDemandLocationProfiles();
+    return collectLoadedLocationLabels();
   }
 
-  function scheduleLocationIndexRefresh() {
+  function scheduleLocationIndexRefresh(delay = 350) {
+    const wait = Number.isFinite(delay) ? Math.max(0, delay) : 350;
+    if (!uiStore.get().panelOpen) {
+      locationIndexPending = true;
+      if (locationIndexTimer) clearTimeout(locationIndexTimer);
+      locationIndexTimer = null;
+      return;
+    }
+    locationIndexPending = false;
     if (locationIndexTimer) clearTimeout(locationIndexTimer);
     locationIndexTimer = setTimeout(() => {
       locationIndexTimer = null;
-      refreshLocationIndex();
-      if (uiStore.get().panelOpen) refreshUi();
-    }, 120);
+      const added = refreshLocationIndex();
+      if (added && uiStore.get().panelOpen) refreshUi();
+    }, wait);
   }
 
   function scheduleGeneralTileLocationRefresh(event) {
     if (event?.sourceId && event.sourceId !== "general-tiles") return;
-    scheduleLocationIndexRefresh();
+    scheduleLocationIndexRefresh(650);
   }
 
   function bindLocationIndex(map) {
@@ -1610,42 +2550,50 @@
     try { map.on("zoomend", scheduleLocationIndexRefresh); } catch {}
     try { map.on("idle", scheduleLocationIndexRefresh); } catch {}
     try { map.on("sourcedata", scheduleGeneralTileLocationRefresh); } catch {}
-    scheduleLocationIndexRefresh();
+    scheduleLocationIndexRefresh(500);
   }
 
   function clearLocationIndexData() {
     locationProfiles.clear();
+    locationStreetCache.clear();
     locationLabelSeen.clear();
+    locationLabelRevision = 0;
     for (const kind of Object.keys(locationLabels)) locationLabels[kind].length = 0;
-    locationGrids.district.clear();
-    locationGrids.street.clear();
+    for (const grid of Object.values(locationGrids)) grid.clear();
+    locationQueryDescriptorMap = null;
+    locationQueryDescriptorsCache = null;
+    locationIndexPending = false;
     locationZoomThresholds.district = 11;
     locationZoomThresholds.street = 14.5;
   }
 
   function nearestStreetFromGameState(location, radiusMeters = 900) {
     if (!Array.isArray(location)) return null;
+    const key = `${locationKey(location)}|${radiusMeters}`;
+    if (locationStreetCache.has(key)) return locationStreetCache.get(key);
+    let value = null;
     try {
       const streets = api.gameState.getStreetsAt?.(location, radiusMeters);
-      if (!Array.isArray(streets)) return null;
-      let best = null;
-      for (const rec of streets) {
-        const props = rec?.properties || rec || {};
-        const name = String(props?.name || "").trim();
-        if (!name) continue;
-        const meters = Number(props?.distanceMeters ?? rec?.distanceMeters);
-        if (!Number.isFinite(meters) || meters > radiusMeters) continue;
-        if (!best || meters < best.meters) best = { name, meters };
+      if (Array.isArray(streets)) {
+        let best = null;
+        for (const rec of streets) {
+          const props = rec?.properties || rec || {};
+          const name = String(props?.name || "").trim();
+          if (!name) continue;
+          const meters = Number(props?.distanceMeters ?? rec?.distanceMeters);
+          if (!Number.isFinite(meters) || meters > radiusMeters) continue;
+          if (!best || meters < best.meters) best = { name, meters };
+        }
+        value = best?.name || null;
       }
-      return best?.name || null;
-    } catch (_) {
-      return null;
-    }
+    } catch (_) {}
+    locationStreetCache.set(key, value);
+    if (locationStreetCache.size > 512) locationStreetCache.delete(locationStreetCache.keys().next().value);
+    return value;
   }
 
   function locationDisplayProfile(location) {
     if (!Array.isArray(location)) return { city: null, district: null, street: null };
-    collectLoadedLocationLabels();
     const profile = resolveLocationProfile(location) || {};
     const street = nearestStreetFromGameState(location) || profile?.street?.name || null;
     return {
@@ -1763,8 +2711,148 @@
     return slug || "area";
   }
 
-  function nextPointId(location) {
-    return `${CFG.NEW_POINT_PREFIX}${areaSlug(location)}:${ledger.pointSeq++}`;
+  function specialPointKind(pointId) {
+    const id = String(pointId || "");
+    if (id.startsWith("AIR_")) return "airport";
+    if (id.startsWith("UNI_")) return "university";
+    return null;
+  }
+
+  function isDemandDeveloperPointId(pointId) {
+    const id = String(pointId || "");
+    return id.startsWith(CFG.NEW_POINT_PREFIX) || id.startsWith("AIR_DD_") || id.startsWith("UNI_DD_") || !!ledger.points?.[id]?.created;
+  }
+
+  function specialCreatePriceSurcharge(kind) {
+    if (kind === "airport") return CFG.AIRPORT_PRICE_SURCHARGE;
+    if (kind === "university") return CFG.UNIVERSITY_PRICE_SURCHARGE;
+    return 0;
+  }
+
+  function specialExpansionPriceMultiplier(kind) {
+    if (kind === "airport") return 2;
+    if (kind === "university") return 1.5;
+    return 1;
+  }
+
+  function existingPointType(point) {
+    const workers = Math.max(0, Number(point?.jobs || 0));
+    const special = workers > 0 ? specialPointKind(point?.id) : null;
+    if (special) return special;
+    const residents = Math.max(0, Number(point?.residents || 0));
+    if (workers > 0 && residents <= 0) return "work";
+    if (residents > 0 && workers <= 0) return "residential";
+    return residents >= workers ? "residential" : "work";
+  }
+
+  function existingTypeSide(type) {
+    return type === "residential" ? "residential" : "work";
+  }
+
+  function existingTypeLabel(type) {
+    if (type === "university") return "University";
+    if (type === "airport") return "Airport";
+    if (type === "work") return "Workers";
+    return "Residents";
+  }
+
+  function pointMatchesExistingType(point, type) {
+    const residents = Math.max(0, Number(point?.residents || 0));
+    const workers = Math.max(0, Number(point?.jobs || 0));
+    const special = specialPointKind(point?.id);
+    if (type === "residential") return residents > 0;
+    if (type === "university") return workers > 0 && special === "university";
+    if (type === "airport") return workers > 0 && special === "airport";
+    if (type === "work") return workers > 0 && !special;
+    return false;
+  }
+
+  function cleanAirportDisplayBase(value) {
+    let name = String(value || "").trim().replace(/\s+/g, " ");
+    if (!name) return null;
+    name = name
+      .replace(/^(?:airport|aerodrome|letiště|aéroport|aeropuerto|aeroporto)\s+/i, "")
+      .replace(/\s+(?:(?:international|regional|municipal)\s+)?(?:airport|aerodrome)$/i, "")
+      .replace(/\s+(?:letiště|aéroport|aeropuerto|aeroporto)$/i, "")
+      .replace(/^[\s._:-]+|[\s._:-]+$/g, "")
+      .trim();
+    return name || null;
+  }
+
+  function nearestMappedAirportName(location, maxDistanceM = 3000) {
+    const map = api.utils.getMap?.();
+    if (!map || !Array.isArray(location)) return null;
+    let layers = [];
+    try { layers = map.getStyle?.()?.layers || []; } catch { return null; }
+    const seen = new Set();
+    let best = null;
+    const consider = (feature) => {
+      const props = feature?.properties || {};
+      const raw = props.name || props.name_en || props["name:en"] || null;
+      const name = cleanAirportDisplayBase(raw);
+      if (!name) return;
+      const d = geometryDistanceFromLocation(location, feature?.geometry);
+      if (!Number.isFinite(d) || d > maxDistanceM) return;
+      if (!best || d < best.distance) best = { name, distance: d };
+    };
+
+    if (map.querySourceFeatures) {
+      for (const layer of layers) {
+        if (placementLayerRole(layer?.id, layer?.["source-layer"], layer?.filter) !== "airport" || !layer?.source) continue;
+        const sourceLayer = layer["source-layer"] || "";
+        const filterKey = layer.filter ? JSON.stringify(layer.filter) : "";
+        const key = `${layer.source}|${sourceLayer}|${filterKey}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        const options = {};
+        if (sourceLayer) options.sourceLayer = sourceLayer;
+        if (layer.filter) options.filter = layer.filter;
+        let features = [];
+        try { features = map.querySourceFeatures(layer.source, options) || []; } catch { continue; }
+        for (const feature of features) consider(feature);
+      }
+    }
+
+    if (!best && map.queryRenderedFeatures) {
+      let center = null;
+      try { center = map.project({ lng: location[0], lat: location[1] }); }
+      catch { try { center = map.project(location); } catch {} }
+      if (Number.isFinite(center?.x) && Number.isFinite(center?.y)) {
+        let features = [];
+        try { features = map.queryRenderedFeatures([[center.x - 160, center.y - 160], [center.x + 160, center.y + 160]]) || []; } catch {}
+        for (const feature of features) {
+          if (placementLayerRole(feature?.layer?.id, feature?.layer?.["source-layer"] || feature?.sourceLayer) === "airport") consider(feature);
+        }
+      }
+    }
+    return best?.name || null;
+  }
+
+  function airportPointBaseName(location) {
+    const mapped = nearestMappedAirportName(location);
+    if (mapped) return mapped;
+    const city = cleanAirportDisplayBase(locationDisplayProfile(location)?.city);
+    if (city) return city;
+    const area = cleanAirportDisplayBase(nearestAreaLabel(location));
+    return area || "Airport";
+  }
+
+  function uniqueAirportPointId(location, points) {
+    const baseName = airportPointBaseName(location);
+    const baseId = `AIR_${baseName}`;
+    if (!points?.has?.(baseId)) return baseId;
+    for (let n = 2; n < 1000; n++) {
+      const id = `AIR_${baseName} ${n}`;
+      if (!points?.has?.(id)) return id;
+    }
+    return `AIR_${baseName} ${ledger.pointSeq++}`;
+  }
+
+  function nextPointId(location, kind = null, points = null) {
+    if (kind === "airport") return uniqueAirportPointId(location, points);
+    const suffix = `${areaSlug(location)}:${ledger.pointSeq++}`;
+    if (kind === "university") return `UNI_DD_${suffix}`;
+    return `${CFG.NEW_POINT_PREFIX}${suffix}`;
   }
   function nextPopId() { return `${CFG.POP_PREFIX}${Date.now().toString(36)}:${ledger.seq++}`; }
 
@@ -1794,25 +2882,43 @@
     }
   }
 
-  function planDevelopment(live, target, side, amount, isCreate) {
+  function planDevelopment(live, target, side, amount, isCreate, createKind = null) {
     if (!DEVELOPMENT_AMOUNTS.includes(amount)) return { ok: false, error: "Unsupported amount" };
     if (!isCreate) {
       const hasResidential = (target?.residents || 0) > 0;
       const hasWork = (target?.jobs || 0) > 0;
-      if (side === "residential" && !hasResidential) return { ok: false, error: "This point has no residents to upgrade." };
-      if (side === "work" && !hasWork) return { ok: false, error: "This point has no work demand to upgrade." };
+      if (side === "residential" && !hasResidential) return { ok: false, error: "This point has no residents." };
+      if (side === "work" && !hasWork) return { ok: false, error: "This point has no work demand." };
     }
-    const priceQuote = quoteDevelopmentPrice(live, target.location, amount, isCreate);
+    const targetKind = isCreate ? createKind : specialPointKind(target?.id);
+    if (isCreate && targetKind && side !== "work") return { ok: false, error: "Special demand points are workplace-only." };
+    const landConversion = isCreate
+      ? (target?.landConversion == null ? requiresLandConversion(target.location) : !!target.landConversion)
+      : false;
+    const airportCluster = isCreate && targetKind === "airport"
+      ? (target?.airportCluster == null ? airportClusterStatus(target.location).cluster : !!target.airportCluster)
+      : null;
+    const priceMultiplier = isCreate
+      ? newPointPriceMultiplier(target.location, side === "work" ? targetKind : null, landConversion, airportCluster)
+      : (side === "work" ? specialExpansionPriceMultiplier(targetKind) : 1);
+    const followupPriceMultiplier = isCreate
+      ? (side === "work" ? specialExpansionPriceMultiplier(targetKind) : 1)
+      : priceMultiplier;
+    const priceQuote = quoteDevelopmentPrice(live, target.location, amount, isCreate, priceMultiplier, followupPriceMultiplier);
     if (!priceQuote.ok || !Number.isFinite(priceQuote.totalCost)) return { ok: false, error: "Could not price development." };
     const before = cloneDemandData(live);
     const planned = cloneDemandData(live);
-    const ledgerBefore = JSON.parse(JSON.stringify(ledger));
-    const donorBands = buildDrivingDonors(planned);
+    const ledgerBefore = cloneLedgerState();
+    const donorBands = drivingDonorsForPlanning(planned);
     let pointId = target.id;
     if (isCreate) {
-      do { pointId = nextPointId(target.location); }
+      do { pointId = nextPointId(target.location, targetKind, planned.points); }
       while (planned.points.has(pointId));
     }
+    const stableTargetSeed = isCreate
+      ? `new:${Number(target.location?.[0]).toFixed(6)},${Number(target.location?.[1]).toFixed(6)}:${targetKind || "normal"}`
+      : String(pointId);
+    const planSeed = `${stableTargetSeed}:${ledger.actions.length}:${side}:${amount}:${isCreate ? "create" : "existing"}:${targetKind || "normal"}`;
     const actionId = `act:${Date.now().toString(36)}:${ledger.seq++}`;
     if (isCreate) {
       ensureNewPoint(planned, pointId, target.location);
@@ -1826,58 +2932,147 @@
       return { ok: false, error: "Target demand point no longer exists." };
     }
     pointLedger(pointId, planned.points.get(pointId));
-    const secondaryContext = createSecondaryContext(planned, target.location, side, pointId, { isCreate });
+    const secondaryContext = createSecondaryContext(planned, target.location, side, pointId, {
+      isCreate,
+      specialKind: side === "work" ? targetKind : null,
+    });
 
-    const steps = amount / CFG.STEP;
     const totalCost = priceQuote.totalCost;
     const allFlows = [];
+    const updatedPopMap = new Map();
     try {
-      for (let step = 0; step < steps; step++) {
-        const p = planned.points.get(pointId);
-        const profile = buildSecondaryProfile(planned, p.location, side, pointId, `${pointId}:${ledger.actions.length}:${step}`, secondaryContext);
-        if (!profile.ok) throw new Error(`Could not find enough valid ${side === "residential" ? "work" : "residential"} points (${profile.reason}).`);
+      const applyProfileFlows = (profile) => {
         for (const flow of profile.flows) {
-          const popId = nextPopId();
           const residenceId = side === "residential" ? pointId : flow.id;
           const jobId = side === "residential" ? flow.id : pointId;
           pointLedger(flow.id, planned.points.get(flow.id));
-          if (!addPlannedPop(planned, residenceId, jobId, popId, flow.size, donorBands)) {
-            throw new Error(`Failed to create planned commuter ${residenceId} -> ${jobId}`);
+          const liveRelation = connectionExistingFlowStats(planned, pointId, side, flow.id);
+          const reusablePopId = liveRelation.totalSize > 0 ? liveRelation.popId : flow.existingPopId;
+          if (reusablePopId != null) {
+            const existingId = String(reusablePopId);
+            const existing = looseMapGet(planned.popsMap, existingId);
+            if (!existing || String(existing.residenceId) !== String(residenceId) || String(existing.jobId) !== String(jobId)) {
+              throw new Error(`Could not reuse existing commuter ${existingId}`);
+            }
+            const existedBeforePlan = looseMapGet(before.popsMap, existingId) != null;
+            if (!increasePlannedPop(planned, existingId, flow.size)) throw new Error(`Failed to expand existing commuter ${existingId}`);
+
+            if (existedBeforePlan) {
+              let update = updatedPopMap.get(existingId);
+              if (!update) {
+                const original = looseMapGet(before.popsMap, existingId);
+                update = {
+                  id: original?.id ?? flow.existingPopId,
+                  beforeSize: Number(original?.size) || 0,
+                  afterSize: Number(original?.size) || 0,
+                  residenceId, jobId, primaryId: pointId, primarySide: side, delta: 0,
+                };
+                updatedPopMap.set(existingId, update);
+              }
+              update.delta += flow.size;
+              update.afterSize += flow.size;
+              const adjKey = `${actionId}:${existingId}`;
+              const adj = ledger.adjustments[adjKey] || {
+                popId: existingId, residenceId, jobId, primaryId: pointId, primarySide: side, actionId, beforeSize: update.beforeSize, delta: 0, active: true,
+              };
+              adj.delta += flow.size;
+              ledger.adjustments[adjKey] = adj;
+            } else {
+              const owned = ledger.pops[existingId];
+              if (!owned || owned.active === false) throw new Error(`Missing planned commuter ledger record ${existingId}`);
+              owned.size = (Number(owned.size) || 0) + flow.size;
+            }
+          } else {
+            const popId = nextPopId();
+            if (!addPlannedPop(planned, residenceId, jobId, popId, flow.size, donorBands)) {
+              throw new Error(`Failed to create planned commuter ${residenceId} -> ${jobId}`);
+            }
+            const plannedPop = planned.popsMap.get(popId);
+            ledger.pops[popId] = {
+              residenceId, jobId, size: flow.size,
+              drivingDistance: Number(plannedPop?.drivingDistance) || 0,
+              drivingSeconds: Number(plannedPop?.drivingSeconds) || 0,
+              actionId, primaryId: pointId, primarySide: side, active: true,
+            };
           }
-          const plannedPop = planned.popsMap.get(popId);
-          ledger.pops[popId] = {
-            residenceId,
-            jobId,
-            size: flow.size,
-            drivingDistance: Number(plannedPop?.drivingDistance) || 0,
-            drivingSeconds: Number(plannedPop?.drivingSeconds) || 0,
-            actionId,
-            primaryId: pointId,
-            primarySide: side,
-            active: true,
-          };
-          const counterpartKey = String(flow.id);
-          secondaryContext.useIndex.set(counterpartKey, (secondaryContext.useIndex.get(counterpartKey) || 0) + 1);
-          secondaryContext.actionUseIndex.set(counterpartKey, (secondaryContext.actionUseIndex.get(counterpartKey) || 0) + 1);
           updateLedgerForFlow(pointId, flow.id, side, flow.size, planned);
-          allFlows.push({ residenceId, jobId, size: flow.size, step: step + 1 });
+          allFlows.push({ residenceId, jobId, size: flow.size });
         }
+      };
+
+      const profile = secondaryContext.specialKind && side === "work"
+        ? buildSpecialActionProfile(planned, target.location, pointId, secondaryContext.specialKind, amount, planSeed, secondaryContext)
+        : buildRegularActionProfile(planned, target.location, side, pointId, amount, planSeed, secondaryContext);
+      if (!profile.ok) {
+        const reason = String(profile.reason || "");
+        const label = secondaryContext.specialKind === "airport"
+          ? "Airport"
+          : secondaryContext.specialKind === "university"
+            ? "University"
+            : side === "residential" ? "residential" : "worker";
+        if (reason === "not-enough-special-capacity" || reason === "not-enough-connection-capacity") {
+          throw new Error(`Not enough suitable connections are available for this ${label} development.`);
+        }
+        if (reason === "special-connection-over-200") {
+          throw new Error("A planned connection would exceed 200 commuters.");
+        }
+        if (reason === "duplicate-special-counterpart") {
+          throw new Error("Could not create a unique set of commuter connections for this development.");
+        }
+        throw new Error(`Could not create a valid connection plan for this ${label} development.`);
       }
+      applyProfileFlows(profile);
+
     } catch (e) {
       ledger = ledgerBefore;
       return { ok: false, error: e instanceof Error ? e.message : String(e) };
     }
 
+    {
+      const byCounterpart = new Set();
+      for (const flow of allFlows) {
+        const counterpart = side === "residential" ? String(flow.jobId) : String(flow.residenceId);
+        if (byCounterpart.has(counterpart)) {
+          ledger = ledgerBefore;
+          return { ok: false, error: "Development plan touched the same connection more than once." };
+        }
+        byCounterpart.add(counterpart);
+        const stats = connectionExistingFlowStats(planned, pointId, side, counterpart);
+        if (stats.totalSize > CFG.CONNECTION_MAX_SIZE) {
+          ledger = ledgerBefore;
+          return { ok: false, error: `Connection ${counterpart} exceeds ${CFG.CONNECTION_MAX_SIZE} commuters.` };
+        }
+      }
+    }
+
+    // Never create a second parallel commuter record for the same residence/job pair.
+    {
+      const beforePairs = activeCommuterPairCounts(before);
+      const plannedPairs = activeCommuterPairCounts(planned);
+      for (const [key, afterCount] of plannedPairs) {
+        const beforeCount = beforePairs.get(key) || 0;
+        const allowedCount = beforeCount > 0 ? beforeCount : 1;
+        if (afterCount > allowedCount) {
+          ledger = ledgerBefore;
+          return { ok: false, error: "Development plan would create a duplicate parallel connection." };
+        }
+      }
+    }
+
     const addedPoints = [...planned.points.values()].filter((p) => !before.points.has(p.id));
     const addedPops = [...planned.popsMap.values()].filter((p) => !before.popsMap.has(p.id));
+    const updatedPops = [...updatedPopMap.values()];
     const totalFlow = allFlows.reduce((sum, f) => sum + (Number(f.size) || 0), 0);
-    if (!allFlows.length || totalFlow !== amount || addedPops.length === 0) {
+    if (!allFlows.length || totalFlow !== amount || (addedPops.length === 0 && updatedPops.length === 0)) {
       ledger = ledgerBefore;
       return { ok: false, error: `Invalid development plan: expected ${amount} commuters, planned ${totalFlow}.` };
     }
-    const ledgerAfter = JSON.parse(JSON.stringify(ledger));
+    const ledgerAfter = cloneLedgerState();
     ledger = ledgerBefore;
-    return { ok: true, before, planned, addedPoints, addedPops, ledgerAfter, pointId, totalCost, flows: allFlows, side, amount, isCreate, actionId };
+    return {
+      ok: true, before, planned, addedPoints, addedPops, updatedPops, ledgerAfter, pointId, totalCost,
+      flows: allFlows, side, amount, isCreate, actionId, createKind: targetKind,
+    };
   }
 
   async function charge(cost) {
@@ -1902,8 +3097,14 @@
     catch (e) { console.error(`${TAG} refund failed`, e); }
   }
 
-  function rollbackApplied(addedPointIds, addedPopIds) {
+  function rollbackApplied(addedPointIds, addedPopIds, reverseUpdates = []) {
     const errors = [];
+    if (reverseUpdates.length) {
+      try {
+        const r = api.demand?.updatePops?.(reverseUpdates);
+        if (!r?.success) errors.push(r?.error || "updatePops rollback failed");
+      } catch (e) { errors.push(String(e)); }
+    }
     if (addedPopIds.length) {
       try {
         const r = api.demand.removePops(addedPopIds);
@@ -1919,7 +3120,116 @@
     return { ok: errors.length === 0, errors };
   }
 
-  function applyPlan(plan) {
+  function validRoutePath(value) {
+    return Array.isArray(value) && value.length >= 2 && value.every((coord) =>
+      Array.isArray(coord) && coord.length >= 2 && Number.isFinite(Number(coord[0])) && Number.isFinite(Number(coord[1]))
+    );
+  }
+
+  async function queryDrivingRoute(dd, residenceId, jobId) {
+    if (typeof api.map?.queryRoute !== "function") return null;
+    const residence = looseMapGet(dd?.points, residenceId);
+    const job = looseMapGet(dd?.points, jobId);
+    if (!Array.isArray(residence?.location) || !Array.isArray(job?.location)) return null;
+    try {
+      const route = await api.map.queryRoute(currentCity(), residence.location, job.location);
+      if (!route) return null;
+      const drivingSeconds = Number(route.drivingSeconds);
+      const drivingDistance = Number(route.drivingDistance);
+      if (!(drivingSeconds > 0) || !(drivingDistance > 0)) return null;
+      return {
+        drivingSeconds,
+        drivingDistance,
+        drivingPath: validRoutePath(route.drivingPath) ? route.drivingPath.map((coord) => [Number(coord[0]), Number(coord[1])]) : null,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  async function mapWithConcurrency(items, limit, worker) {
+    const results = new Array(items.length);
+    let cursor = 0;
+    async function run() {
+      while (true) {
+        const index = cursor++;
+        if (index >= items.length) return;
+        results[index] = await worker(items[index], index);
+      }
+    }
+    const count = Math.max(1, Math.min(Number(limit) || 1, items.length || 1));
+    await Promise.all(Array.from({ length: count }, run));
+    return results;
+  }
+
+  async function preparePopAdditions(plan) {
+    const live = api.gameState.getDemandData?.() || plan.planned;
+    const routes = await mapWithConcurrency(plan.addedPops, CFG.ROUTE_QUERY_CONCURRENCY, (pop) =>
+      queryDrivingRoute(live, pop.residenceId, pop.jobId)
+    );
+    return plan.addedPops.map((pop, index) => {
+      const route = routes[index];
+      const addition = { residenceId: pop.residenceId, jobId: pop.jobId, size: pop.size };
+      if (route) {
+        addition.drivingSeconds = route.drivingSeconds;
+        addition.drivingDistance = route.drivingDistance;
+      }
+      return { addition, route };
+    });
+  }
+
+  function installOwnedPopPathProvider() {
+    if (typeof window.fetch !== "function") return;
+    const provider = async (city, popId) => {
+      if (city !== currentCity()) return null;
+      const rec = ledger.pops?.[popId];
+      if (!rec || rec.active === false) return null;
+      if (validRoutePath(rec.drivingPath)) return rec.drivingPath;
+      const route = await queryDrivingRoute(api.gameState.getDemandData?.(), rec.residenceId, rec.jobId);
+      if (!route?.drivingPath) return null;
+      rec.drivingPath = cloneJsonSafe(route.drivingPath);
+      rec.drivingSeconds = route.drivingSeconds;
+      rec.drivingDistance = route.drivingDistance;
+      saveLedger();
+      return rec.drivingPath;
+    };
+
+    const tagged = window.fetch;
+    if (tagged.__demandDeveloperPathProvider) {
+      tagged.__demandDeveloperPathProvider = provider;
+      return;
+    }
+
+    const realFetch = tagged.bind(window);
+    const pathPattern = /^map:\/\/paths\/([^/]+)\/([^/]+)$/;
+    const patchedFetch = async (input, init) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input?.url || "";
+      const match = pathPattern.exec(url);
+      if (!match) return realFetch(input, init);
+
+      let originalResponse = null;
+      try {
+        originalResponse = await realFetch(input, init);
+        if (originalResponse?.ok) return originalResponse;
+      } catch {}
+
+      let path = null;
+      try {
+        const city = decodeURIComponent(match[1]);
+        const popId = decodeURIComponent(match[2]);
+        path = await patchedFetch.__demandDeveloperPathProvider?.(city, popId);
+      } catch {}
+      if (!validRoutePath(path)) return originalResponse ?? new Response("", { status: 404 });
+      return new Response(JSON.stringify({ coordinates: path }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    };
+    patchedFetch.__demandDeveloperPathProvider = provider;
+    window.fetch = patchedFetch;
+  }
+
+  async function applyPlan(plan) {
     if (!api.demand) return { ok: false, error: "Subway Builder demand editor API is unavailable." };
     const addedPointIds = [];
     const addedPopIds = [];
@@ -1936,13 +3246,8 @@
       addedPointIds.push(r.pointId);
     }
     if (plan.addedPops.length) {
-      const additions = plan.addedPops.map((p) => ({
-        residenceId: p.residenceId,
-        jobId: p.jobId,
-        size: p.size,
-        drivingSeconds: p.drivingSeconds,
-        drivingDistance: p.drivingDistance,
-      }));
+      const prepared = await preparePopAdditions(plan);
+      const additions = prepared.map((item) => item.addition);
       const r = api.demand.addPops(additions);
       if (!r.success) {
         const rb = rollbackApplied(addedPointIds, addedPopIds);
@@ -1958,10 +3263,28 @@
       for (let i = 0; i < provisional.length; i++) {
         const rec = plan.ledgerAfter.pops[provisional[i]];
         if (!rec) continue;
+        const route = prepared[i]?.route;
+        if (route) {
+          rec.drivingSeconds = route.drivingSeconds;
+          rec.drivingDistance = route.drivingDistance;
+          if (route.drivingPath) rec.drivingPath = cloneJsonSafe(route.drivingPath);
+        }
         delete plan.ledgerAfter.pops[provisional[i]];
         plan.ledgerAfter.pops[addedPopIds[i]] = rec;
       }
     }
+    const reverseUpdates = [];
+    if (plan.updatedPops?.length) {
+      const updates = plan.updatedPops.map((item) => ({ id: item.id, size: item.afterSize }));
+      reverseUpdates.push(...plan.updatedPops.map((item) => ({ id: item.id, size: item.beforeSize })));
+      let r = null;
+      try { r = api.demand.updatePops(updates); } catch (e) { r = { success: false, error: String(e) }; }
+      if (!r?.success) {
+        const rb = rollbackApplied(addedPointIds, addedPopIds);
+        return { ok: false, error: (r?.error || "updatePops failed") + (rb.ok ? "" : `; rollback failed: ${rb.errors.join("; ")}`) };
+      }
+    }
+
     const liveAfter = api.gameState.getDemandData();
     const targetAfter = looseMapGet(liveAfter?.points, plan.pointId);
     const targetBefore = looseMapGet(plan.before?.points, plan.pointId);
@@ -1983,14 +3306,33 @@
         const residencePoint = looseMapGet(liveAfter?.points, expected?.residenceId);
         const jobPoint = looseMapGet(liveAfter?.points, expected?.jobId);
         const attached = pointHasPopId(residencePoint, id) && pointHasPopId(jobPoint, id);
+        const ledgerRec = plan.ledgerAfter.pops?.[String(id)] ?? plan.ledgerAfter.pops?.[id];
+        if (ledgerRec && livePop) capturePopRuntimeIntoRecord(ledgerRec, livePop);
         if (!endpointsMatch || !sizeMatch || !attached) {
           popAuditError = `commuter ${id} is missing, detached, or does not match the requested flow`;
           break;
         }
       }
     }
+    let updateAuditError = null;
+    if (!popAuditError && liveAfter?.popsMap) {
+      for (const item of plan.updatedPops || []) {
+        const livePop = looseMapGet(liveAfter.popsMap, item.id);
+        const endpointsMatch = !!livePop &&
+          String(livePop.residenceId || "") === String(item.residenceId || "") &&
+          String(livePop.jobId || "") === String(item.jobId || "");
+        const sizeMatch = !!livePop && Math.abs((Number(livePop.size) || 0) - (Number(item.afterSize) || 0)) < 0.001;
+        const residencePoint = looseMapGet(liveAfter?.points, item.residenceId);
+        const jobPoint = looseMapGet(liveAfter?.points, item.jobId);
+        const attached = !!livePop && pointHasPopId(residencePoint, livePop.id ?? item.id) && pointHasPopId(jobPoint, livePop.id ?? item.id);
+        if (!endpointsMatch || !sizeMatch || !attached) {
+          updateAuditError = `updated commuter ${item.id} is missing, detached, or has the wrong size`;
+          break;
+        }
+      }
+    }
     let endpointAuditError = null;
-    if (!popAuditError && liveAfter?.points) {
+    if (!popAuditError && !updateAuditError && liveAfter?.points) {
       const expectedByPoint = new Map();
       const addExpected = (id, field, size) => {
         const key = String(id);
@@ -2002,10 +3344,15 @@
         addExpected(pop.residenceId, "residents", pop.size);
         addExpected(pop.jobId, "jobs", pop.size);
       }
+      for (const item of plan.updatedPops || []) {
+        const delta = Math.max(0, (Number(item.afterSize) || 0) - (Number(item.beforeSize) || 0));
+        addExpected(item.residenceId, "residents", delta);
+        addExpected(item.jobId, "jobs", delta);
+      }
       for (const rec of expectedByPoint.values()) {
         const beforePoint = looseMapGet(plan.before?.points, rec.id);
         const afterPoint = looseMapGet(liveAfter.points, rec.id);
-        if (!afterPoint) { endpointAuditError = `counterpart point ${rec.id} is missing after addPops`; break; }
+        if (!afterPoint) { endpointAuditError = `counterpart point ${rec.id} is missing after demand update`; break; }
         const expectedResidents = (Number(beforePoint?.residents) || 0) + rec.residents;
         const expectedJobs = (Number(beforePoint?.jobs) || 0) + rec.jobs;
         const actualResidents = Number(afterPoint.residents);
@@ -2020,9 +3367,9 @@
         }
       }
     }
-    if (!targetAfter || !Number.isFinite(actualPrimary) || actualPrimary + 0.001 < expectedPrimary || popAuditError || endpointAuditError) {
-      const rb = rollbackApplied(addedPointIds, addedPopIds);
-      const detail = popAuditError || endpointAuditError || `expected at least ${expectedPrimary} ${plan.side === "residential" ? "residents" : "jobs"}, got ${Number.isFinite(actualPrimary) ? actualPrimary : "missing"}`;
+    if (!targetAfter || !Number.isFinite(actualPrimary) || actualPrimary + 0.001 < expectedPrimary || popAuditError || updateAuditError || endpointAuditError) {
+      const rb = rollbackApplied(addedPointIds, addedPopIds, reverseUpdates);
+      const detail = popAuditError || updateAuditError || endpointAuditError || `expected at least ${expectedPrimary} ${plan.side === "residential" ? "residents" : "jobs"}, got ${Number.isFinite(actualPrimary) ? actualPrimary : "missing"}`;
       return {
         ok: false,
         error: `Post-apply audit failed for ${plan.pointId}: ${detail}.` +
@@ -2036,18 +3383,26 @@
       if (rec && livePop) capturePopRuntimeIntoRecord(rec, livePop);
     }
 
-    return { ok: true, addedPointIds, addedPopIds };
+    return { ok: true };
   }
 
   async function executePlan(plan) {
     const c = await charge(plan.totalCost);
     if (!c.ok) return c;
-    const applied = applyPlan(plan);
+    let applied;
+    beginInternalDemandMutation();
+    try {
+      applied = await applyPlan(plan);
+    } finally {
+      endInternalDemandMutation();
+    }
     if (!applied.ok) {
       refund(plan.totalCost);
+      invalidatePreviews({ demand: true });
       return applied;
     }
     ledger = plan.ledgerAfter;
+    rememberPlanningDemandSignature(api.gameState.getDemandData?.());
     ledger.actions.push({
       id: plan.actionId,
       at: Date.now(),
@@ -2059,6 +3414,7 @@
       chargedCost: c.charged,
       chargeMethod: "setMoney-verified",
       create: plan.isCreate,
+      createKind: plan.createKind || null,
       active: true,
     });
     saveLedger();
@@ -2069,6 +3425,16 @@
     if (!point) return 6;
     const value = Math.max(0, Number(side === "residential" ? point.residents : point.jobs) || 0);
     return clamp(1.8 + 0.57 * Math.sqrt(value), 3.0, 39);
+  }
+
+  function flowBubbleRadius(size) {
+    const value = clamp(Number(size) || 0, 0, CFG.CONNECTION_MAX_SIZE);
+    if (value <= 0) return 2.5;
+    const minFlow = 1;
+    const minRadius = 2.5;
+    const maxRadius = 24;
+    const normalized = (value - minFlow) / Math.max(1, CFG.CONNECTION_MAX_SIZE - minFlow);
+    return clamp(minRadius + (maxRadius - minRadius) * normalized, minRadius, maxRadius);
   }
 
   function focusDemandPoint(pointId, { zoom = 14 } = {}) {
@@ -2150,6 +3516,20 @@
       }
     }
 
+    for (const rec of Object.values(ledger.adjustments || {})) {
+      if (!rec || rec.active === false || rec.primaryId == null) continue;
+      const g = groups.get(String(rec.primaryId));
+      if (!g) continue;
+      const size = Math.max(0, Number(rec.delta) || 0);
+      if (rec.primarySide === "residential") {
+        g.counterpartWorkers += size;
+        if (rec.jobId != null && String(rec.jobId) !== String(rec.primaryId)) g.counterpartPointIds.add(String(rec.jobId));
+      } else if (rec.primarySide === "work") {
+        g.counterpartResidents += size;
+        if (rec.residenceId != null && String(rec.residenceId) !== String(rec.primaryId)) g.counterpartPointIds.add(String(rec.residenceId));
+      }
+    }
+
     activeDevelopmentGroupsCache = [...groups.values()].map((g) => ({
       ...g,
       counterpartPoints: g.counterpartPointIds.size,
@@ -2178,6 +3558,12 @@
     for (const rec of Object.values(ledger.pops || {})) {
       if (!rec || rec.active === false) continue;
       const size = Number(rec.size) || 0;
+      if (ledger.points?.[rec.residenceId]) ledger.points[rec.residenceId].addedResidents += size;
+      if (ledger.points?.[rec.jobId]) ledger.points[rec.jobId].addedJobs += size;
+    }
+    for (const rec of Object.values(ledger.adjustments || {})) {
+      if (!rec || rec.active === false) continue;
+      const size = Number(rec.delta) || 0;
       if (ledger.points?.[rec.residenceId]) ledger.points[rec.residenceId].addedResidents += size;
       if (ledger.points?.[rec.jobId]) ledger.points[rec.jobId].addedJobs += size;
     }
@@ -2231,14 +3617,14 @@
         let actualId = null;
         const exactKey = looseMapKey(dd.popsMap, ledgerId);
         const exact = exactKey == null ? null : dd.popsMap.get(exactKey);
-        if (popMatchesLedgerRecord(exact, rec) && !used.has(String(exact?.id ?? exactKey))) {
+        if (popMatchesLedgerRecord(exact, rec, ledgerId) && !used.has(String(exact?.id ?? exactKey))) {
           actualId = exact?.id ?? exactKey;
         } else {
           for (const candidateId of candidatePopIdsForLedgerRecord(dd, rec)) {
             const candidateKey = String(candidateId);
             if (used.has(candidateKey)) continue;
             const live = looseMapGet(dd.popsMap, candidateId);
-            if (!popMatchesLedgerRecord(live, rec)) continue;
+            if (!popMatchesLedgerRecord(live, rec, ledgerId)) continue;
             actualId = live?.id ?? candidateId;
             break;
           }
@@ -2268,22 +3654,86 @@
     return repaired;
   }
 
-  function popMatchesLedgerRecord(live, rec) {
+  function activeAdjustmentDeltaForPop(popId) {
+    const wanted = String(popId);
+    let total = 0;
+    for (const rec of Object.values(ledger.adjustments || {})) {
+      if (!rec || rec.active === false || String(rec.popId) !== wanted) continue;
+      total += Math.max(0, Number(rec.delta) || 0);
+    }
+    return total;
+  }
+
+  function popMatchesLedgerRecord(live, rec, ledgerId = null) {
     return !!live && !!rec &&
       String(live.residenceId ?? "") === String(rec.residenceId ?? "") &&
       String(live.jobId ?? "") === String(rec.jobId ?? "") &&
-      Math.abs((Number(live.size) || 0) - (Number(rec.size) || 0)) < 0.001;
+      Math.abs((Number(live.size) || 0) - ((Number(rec.size) || 0) + activeAdjustmentDeltaForPop(ledgerId ?? live.id ?? rec.id ?? ""))) < 0.001;
+  }
+
+  function activeAdjustmentGroups() {
+    const groups = new Map();
+    // Active deltas always apply to the oldest known baseline.
+    for (const rec of Object.values(ledger.adjustments || {})) {
+      if (!rec || rec.popId == null) continue;
+      const key = String(rec.popId);
+      let g = groups.get(key);
+      if (!g) {
+        g = { popId: rec.popId, beforeSize: Infinity, delta: 0, residenceId: rec.residenceId, jobId: rec.jobId };
+        groups.set(key, g);
+      }
+      const before = Number(rec.beforeSize);
+      if (Number.isFinite(before)) g.beforeSize = Math.min(g.beforeSize, before);
+      if (rec.active !== false) g.delta += Math.max(0, Number(rec.delta) || 0);
+    }
+    for (const [key, g] of groups) if (!(g.delta > 0)) groups.delete(key);
+    return groups;
+  }
+
+  function restoreMissingAdjustmentGrowth(dd) {
+    if (!dd?.popsMap || typeof api.demand?.updatePops !== "function") return { ok: true, updatedCount: 0, reverseUpdates: [] };
+    const updates = [];
+    const reverseUpdates = [];
+    for (const g of activeAdjustmentGroups().values()) {
+      const pop = looseMapGet(dd.popsMap, g.popId);
+      if (!pop) return { ok: false, error: `Could not restore adjusted commuter ${g.popId}: commuter is missing.`, reverseUpdates };
+      if (String(pop.residenceId) !== String(g.residenceId) || String(pop.jobId) !== String(g.jobId)) {
+        return { ok: false, error: `Could not restore adjusted commuter ${g.popId}: endpoints no longer match.`, reverseUpdates };
+      }
+      if (!Number.isFinite(g.beforeSize)) return { ok: false, error: `Could not restore adjusted commuter ${g.popId}: saved baseline is invalid.`, reverseUpdates };
+      const expected = g.beforeSize + g.delta;
+      const current = Number(pop.size) || 0;
+      if (current + 0.001 < expected) {
+        const id = pop.id ?? g.popId;
+        updates.push({ id, size: expected });
+        reverseUpdates.push({ id, size: current });
+      }
+    }
+    if (!updates.length) return { ok: true, updatedCount: 0, reverseUpdates: [] };
+    let r = null;
+    try { r = api.demand.updatePops(updates); } catch (e) { r = { success: false, error: String(e) }; }
+    return r?.success
+      ? { ok: true, updatedCount: Number(r.updatedCount ?? updates.length), reverseUpdates }
+      : { ok: false, error: r?.error || "Could not restore expanded commuter connections.", reverseUpdates };
   }
 
   let replayingLedgerDemand = false;
+  let internalDemandMutationDepth = 0;
+
+  function beginInternalDemandMutation() { internalDemandMutationDepth += 1; }
+  function endInternalDemandMutation() { internalDemandMutationDepth = Math.max(0, internalDemandMutationDepth - 1); }
 
   async function replayActiveLedgerDemand(dd) {
     if (!dd?.points || !dd?.popsMap) return { ok: false, error: "Live demand data is unavailable." };
     if (!api.demand) return { ok: false, error: "Subway Builder demand editor API is unavailable." };
 
     const activeEntries = Object.entries(ledger.pops || {}).filter(([, rec]) => rec && rec.active !== false && (Number(rec.size) || 0) > 0);
-    if (!activeEntries.length) return { ok: true, restoredPops: 0, recreatedPoints: 0, rekeyed: 0 };
+    const hasActiveAdjustments = activeAdjustmentGroups().size > 0;
+    if (!activeEntries.length && !hasActiveAdjustments) {
+      return { ok: true, restoredPops: 0, recreatedPoints: 0, rekeyed: 0 };
+    }
 
+    const ledgerBeforeReplay = cloneLedgerState();
     let ledgerChanged = false;
     const activeEndpointIds = new Set();
     for (const [, rec] of activeEntries) {
@@ -2306,25 +3756,53 @@
       const loc = rec?.location;
       const validLoc = Array.isArray(loc) && loc.length >= 2 && Number.isFinite(Number(loc[0])) && Number.isFinite(Number(loc[1]));
       if (!rec?.created || !validLoc) {
+        ledger = ledgerBeforeReplay;
         return { ok: false, error: `Cannot safely restore Demand Developer because demand point ${id} is missing${rec?.created ? " and its older ledger has no saved location" : ""}.` };
       }
       pointsToCreate.push({ id, location: [Number(loc[0]), Number(loc[1])] });
     }
 
     const missing = [];
+    const baseResizeRestores = [];
     for (const [ledgerId, rec] of activeEntries) {
       const exactKey = looseMapKey(dd.popsMap, ledgerId);
-      if (exactKey != null && liveOwnedPopIsComplete(dd, exactKey, rec)) continue;
+      if (exactKey != null) {
+        const livePop = dd.popsMap.get(exactKey);
+        const residence = looseMapGet(dd.points, rec.residenceId);
+        const job = looseMapGet(dd.points, rec.jobId);
+        const endpointsMatch = !!livePop &&
+          String(livePop.residenceId ?? "") === String(rec.residenceId ?? "") &&
+          String(livePop.jobId ?? "") === String(rec.jobId ?? "");
+        const attached = endpointsMatch && pointHasPopId(residence, exactKey) && pointHasPopId(job, exactKey);
+        const currentSize = Number(livePop?.size) || 0;
+        const expectedBaseSize = Number(rec.size) || 0;
+        if (endpointsMatch && attached) {
+          if (currentSize + 0.001 >= expectedBaseSize) continue;
+          baseResizeRestores.push({ id: livePop.id ?? exactKey, beforeSize: currentSize, afterSize: expectedBaseSize });
+          continue;
+        }
+      }
       missing.push({ ledgerId: String(ledgerId), rec });
     }
 
-    if (!pointsToCreate.length && !missing.length) {
+    if (!pointsToCreate.length && !missing.length && !baseResizeRestores.length && !hasActiveAdjustments) {
       if (ledgerChanged) await saveLedger();
       return { ok: true, restoredPops: 0, recreatedPoints: 0, rekeyed: 0 };
     }
 
     const createdPointIds = [];
     const addedPopIds = [];
+    let reverseAdjustmentUpdates = [];
+    const rollbackReplay = (message, extraPointIds = [], extraPopIds = [], extraReverseUpdates = []) => {
+      const pointIds = [...new Set([...createdPointIds, ...extraPointIds].filter(Boolean).map(String))];
+      const popIds = [...new Set([...addedPopIds, ...extraPopIds].filter((id) => id != null).map((id) => id))];
+      const reverseUpdates = [...reverseAdjustmentUpdates, ...extraReverseUpdates];
+      const rb = rollbackApplied(pointIds, popIds, reverseUpdates);
+      ledger = ledgerBeforeReplay;
+      clearDevelopmentSummaryCaches();
+      return { ok: false, error: message + (rb.ok ? "" : `; rollback failed: ${rb.errors.join("; ")}`) };
+    };
+
     replayingLedgerDemand = true;
     try {
       for (const item of missing) detachLedgerPopObject(dd, item.ledgerId, item.rec);
@@ -2332,66 +3810,100 @@
       for (const point of pointsToCreate) {
         const r = api.demand.addDemandPoint?.({ id: point.id, location: point.location });
         if (!r?.success || String(r.pointId ?? point.id) !== String(point.id)) {
-          for (const id of addedPopIds) {
-            const rec = ledger.pops?.[String(id)] ?? ledger.pops?.[id];
-            if (rec) detachLedgerPopObject(api.gameState.getDemandData?.() || dd, id, rec);
-          }
-          const rb = rollbackApplied(createdPointIds, []);
-          return { ok: false, error: `Could not recreate Demand Developer point ${point.id}: ${r?.error || "unexpected point id"}` + (rb.ok ? "" : `; rollback failed: ${rb.errors.join("; ")}`) };
+          return rollbackReplay(
+            `Could not recreate Demand Developer point ${point.id}: ${r?.error || "unexpected point id"}`,
+            r?.pointId && String(r.pointId) !== String(point.id) ? [r.pointId] : []
+          );
         }
         createdPointIds.push(r.pointId ?? point.id);
       }
 
       let live = api.gameState.getDemandData?.() || dd;
       if (!live?.points || !live?.popsMap) {
-        const rb = rollbackApplied(createdPointIds, []);
-        return { ok: false, error: "Live demand disappeared while restoring Demand Developer." + (rb.ok ? "" : ` Rollback failed: ${rb.errors.join("; ")}`) };
+        return rollbackReplay("Live demand disappeared while restoring Demand Developer.");
       }
 
-      for (const item of missing) {
-        const res = looseMapGet(live.points, item.rec.residenceId);
-        const job = looseMapGet(live.points, item.rec.jobId);
-        if (!res || !job) {
-          for (const id of addedPopIds) {
-            const rec = ledger.pops?.[String(id)] ?? ledger.pops?.[id];
-            if (rec) detachLedgerPopObject(live, id, rec);
+      if (baseResizeRestores.length) {
+        let baseResizeResult = null;
+        try {
+          baseResizeResult = api.demand.updatePops?.(baseResizeRestores.map((item) => ({ id: item.id, size: item.afterSize })));
+        } catch (e) {
+          baseResizeResult = { success: false, error: String(e) };
+        }
+        if (!baseResizeResult?.success) {
+          return rollbackReplay(baseResizeResult?.error || "Could not restore saved commuter sizes.");
+        }
+        reverseAdjustmentUpdates.push(...baseResizeRestores.map((item) => ({ id: item.id, size: item.beforeSize })));
+        live = api.gameState.getDemandData?.() || live;
+      }
+
+      if (missing.length) {
+        const replayPrepared = await mapWithConcurrency(missing, CFG.ROUTE_QUERY_CONCURRENCY, async (item) => {
+          const res = looseMapGet(live.points, item.rec.residenceId);
+          const job = looseMapGet(live.points, item.rec.jobId);
+          if (!res || !job) return { item, error: `endpoint missing for ${item.rec.residenceId} -> ${item.rec.jobId}` };
+          const addition = { residenceId: item.rec.residenceId, jobId: item.rec.jobId, size: (Number(item.rec.size) || 0) + activeAdjustmentDeltaForPop(item.ledgerId) };
+          const savedSeconds = Number(item.rec.drivingSeconds);
+          const savedDistance = Number(item.rec.drivingDistance);
+          let route = null;
+          if (savedSeconds > 0 && savedDistance > 0) {
+            addition.drivingSeconds = savedSeconds;
+            addition.drivingDistance = savedDistance;
+          } else {
+            route = await queryDrivingRoute(live, item.rec.residenceId, item.rec.jobId);
+            if (route) {
+              addition.drivingSeconds = route.drivingSeconds;
+              addition.drivingDistance = route.drivingDistance;
+            }
           }
-          const rb = rollbackApplied(createdPointIds, []);
-          return { ok: false, error: `Could not restore commuter ${item.rec.residenceId} -> ${item.rec.jobId}: endpoint missing.` + (rb.ok ? "" : ` Rollback failed: ${rb.errors.join("; ")}`) };
+          return { item, addition, route };
+        });
+        const bad = replayPrepared.find((entry) => entry.error);
+        if (bad) return rollbackReplay(`Could not restore commuter: ${bad.error}.`);
+
+        const replayResult = api.demand.addPops(replayPrepared.map((entry) => entry.addition));
+        if (!replayResult?.success || !Array.isArray(replayResult.popIds) || replayResult.popIds.length !== replayPrepared.length) {
+          const returned = Array.isArray(replayResult?.popIds) ? replayResult.popIds : [];
+          return rollbackReplay(`Could not restore saved commuters: ${replayResult?.error || "addPops failed"}.`, [], returned);
         }
-        if (!(Number(item.rec.drivingDistance) > 0) || !(Number(item.rec.drivingSeconds) > 0)) {
-          const donorBands = buildDrivingDonors(live);
-          const drive = estimateDriving(live, `replay:${item.ledgerId}`, item.rec.residenceId, item.rec.jobId, donorBands);
-          if (!(Number(item.rec.drivingDistance) > 0)) item.rec.drivingDistance = drive.distance;
-          if (!(Number(item.rec.drivingSeconds) > 0)) item.rec.drivingSeconds = drive.seconds;
-          ledgerChanged = true;
-        }
-        if (!materializeLedgerPop(live, item.ledgerId, item.rec)) {
-          for (const id of addedPopIds) {
-            const rec = ledger.pops?.[String(id)] ?? ledger.pops?.[id];
-            if (rec) detachLedgerPopObject(live, id, rec);
+        for (let i = 0; i < replayPrepared.length; i++) {
+          const { item, route } = replayPrepared[i];
+          const newId = String(replayResult.popIds[i]);
+          const rec = item.rec;
+          if (route) {
+            rec.drivingSeconds = route.drivingSeconds;
+            rec.drivingDistance = route.drivingDistance;
+            if (route.drivingPath) rec.drivingPath = cloneJsonSafe(route.drivingPath);
           }
-          const rb = rollbackApplied(createdPointIds, []);
-          return { ok: false, error: `Could not materialize saved commuter ${item.rec.residenceId} -> ${item.rec.jobId}.` + (rb.ok ? "" : ` Rollback failed: ${rb.errors.join("; ")}`) };
+          if (newId !== item.ledgerId) {
+            delete ledger.pops[item.ledgerId];
+            ledger.pops[newId] = rec;
+            for (const adj of Object.values(ledger.adjustments || {})) {
+              if (adj && String(adj.popId) === String(item.ledgerId)) adj.popId = newId;
+            }
+          }
+          addedPopIds.push(newId);
         }
-        addedPopIds.push(String(item.ledgerId));
+        live = api.gameState.getDemandData?.() || live;
+        ledgerChanged = true;
+      }
+
+      const adjustmentRestore = restoreMissingAdjustmentGrowth(live);
+      if (!adjustmentRestore.ok) {
+        return rollbackReplay(adjustmentRestore.error, [], [], adjustmentRestore.reverseUpdates || []);
+      }
+      reverseAdjustmentUpdates = adjustmentRestore.reverseUpdates || [];
+      if (adjustmentRestore.updatedCount) {
+        live = api.gameState.getDemandData?.() || live;
+        ledgerChanged = true;
       }
 
       reconcilePointTotalsFromLedger(live);
 
-      if (addedPopIds.length && typeof api.demand?.updatePops === "function") {
-        try {
-          const touch = api.demand.updatePops(addedPopIds.map((id) => ({ id, size: Number(ledger.pops?.[id]?.size) || 0 })));
-          if (!touch?.success) console.warn(`${TAG} restored pops are live but demand refresh touch failed: ${touch?.error || "updatePops failed"}`);
-          live = api.gameState.getDemandData?.() || live;
-        } catch (e) {
-          console.warn(`${TAG} restored pops are live but demand refresh touch threw`, e);
-        }
-      }
-
-      for (const item of missing) {
-        if (!liveOwnedPopIsComplete(live, item.ledgerId, item.rec)) {
-          return { ok: false, error: `Restored commuter ${item.rec.residenceId} -> ${item.rec.jobId} failed verification.` };
+      for (const [id, rec] of Object.entries(ledger.pops || {})) {
+        if (!rec || rec.active === false || !(Number(rec.size) > 0)) continue;
+        if (!liveOwnedPopIsComplete(live, id, rec)) {
+          return rollbackReplay(`Restored commuter ${id} failed verification.`);
         }
       }
       if (missing.length) ledgerChanged = true;
@@ -2400,8 +3912,7 @@
       if (ledgerChanged || createdPointIds.length || addedPopIds.length) await saveLedger();
       return { ok: true, restoredPops: addedPopIds.length, recreatedPoints: createdPointIds.length, rekeyed: 0 };
     } catch (e) {
-      const rb = rollbackApplied(createdPointIds, addedPopIds);
-      return { ok: false, error: `Demand Developer replay failed: ${String(e?.message || e)}` + (rb.ok ? "" : `; rollback failed: ${rb.errors.join("; ")}`) };
+      return rollbackReplay(`Demand Developer replay failed: ${String(e?.message || e)}`);
     } finally {
       replayingLedgerDemand = false;
     }
@@ -2424,7 +3935,7 @@
     for (const item of requested) {
       const actualKey = looseMapKey(dd.popsMap, item.ledgerId);
       const live = actualKey == null ? null : dd.popsMap.get(actualKey);
-      if (!popMatchesLedgerRecord(live, item.rec)) continue;
+      if (!popMatchesLedgerRecord(live, item.rec, item.ledgerId)) continue;
       const actualId = live.id ?? actualKey;
       item.liveId = actualId;
       used.add(String(actualId));
@@ -2455,7 +3966,7 @@
           const key = String(candidateId);
           if (used.has(key)) continue;
           const live = looseMapGet(dd.popsMap, candidateId);
-          if (!popMatchesLedgerRecord(live, item.rec)) continue;
+          if (!popMatchesLedgerRecord(live, item.rec, item.ledgerId)) continue;
           if (key.startsWith("mod-pop-")) {
             item.liveId = live?.id ?? candidateId;
             used.add(String(item.liveId));
@@ -2484,10 +3995,31 @@
     return { ok: true, resolved: requested };
   }
 
-  function activeOwnedPopCount() {
-    let count = 0;
-    for (const rec of Object.values(ledger.pops || {})) if (rec && rec.active !== false) count += 1;
-    return count;
+  function hasAnyActiveDevelopment() {
+    if (Object.values(ledger.pops || {}).some((rec) => rec && rec.active !== false)) return true;
+    if (Object.values(ledger.adjustments || {}).some((rec) => rec && rec.active !== false)) return true;
+    return (ledger.actions || []).some((action) => action && action.active !== false);
+  }
+
+  function cleanupEmptyCreatedPoints(dd = api.gameState.getDemandData?.()) {
+    if (!dd?.points || typeof api.demand?.removeDemandPoint !== "function") return { removedCount: 0, errors: [] };
+    let removedCount = 0;
+    const errors = [];
+    for (const [pointId, live] of dd.points.entries()) {
+      if (!isDemandDeveloperPointId(pointId)) continue;
+      const popCount = live?.popIds && typeof live.popIds !== "string" && typeof live.popIds[Symbol.iterator] === "function"
+        ? [...live.popIds].length
+        : 0;
+      if ((Number(live?.residents) || 0) > 0 || (Number(live?.jobs) || 0) > 0 || popCount > 0) continue;
+      try {
+        const r = api.demand.removeDemandPoint(pointId);
+        if (r?.success === false) errors.push(r.error || `removeDemandPoint failed for ${pointId}`);
+        else removedCount++;
+      } catch (e) {
+        errors.push(String(e?.message || e));
+      }
+    }
+    return { removedCount, errors };
   }
 
   function removeOwnedPops(popIds) {
@@ -2512,43 +4044,194 @@
     } catch (e) { return { ok: false, error: String(e?.message || e) }; }
   }
 
+  function revertAdjustments(records) {
+    const dd = api.gameState.getDemandData?.();
+    if (!records.length) return { ok: true, revertedCount: 0, undoUpdates: [], revertedEntries: [] };
+    const grouped = new Map();
+    for (const item of records) {
+      const rec = item.rec;
+      if (!rec || rec.active === false) continue;
+      const pop = looseMapGet(dd?.popsMap, rec.popId);
+      if (!pop) return { ok: false, error: `Could not find adjusted commuter ${rec.popId}.` };
+      const key = String(pop.id ?? rec.popId);
+      let g = grouped.get(key);
+      if (!g) { g = { id: pop.id ?? rec.popId, current: Number(pop.size) || 0, delta: 0, entries: [] }; grouped.set(key, g); }
+      g.delta += Number(rec.delta) || 0;
+      g.entries.push(item);
+    }
+    const updates = [...grouped.values()].map((g) => ({ id: g.id, size: Math.max(1, g.current - g.delta) }));
+    const undoUpdates = [...grouped.values()].map((g) => ({ id: g.id, size: g.current }));
+    let r = null;
+    try { r = api.demand?.updatePops?.(updates); } catch (e) { r = { success: false, error: String(e) }; }
+    if (!r?.success) return { ok: false, error: r?.error || "Could not revert expanded commuter connections." };
+    const revertedEntries = [...grouped.values()].flatMap((g) => g.entries);
+    const now = Date.now();
+    for (const item of revertedEntries) { item.rec.active = false; item.rec.removedAt = now; }
+    rebuildLedgerPointAdditions();
+    return { ok: true, revertedCount: revertedEntries.length, undoUpdates, revertedEntries };
+  }
+
+  function undoRevertedAdjustments(reverted) {
+    const updates = reverted?.undoUpdates || [];
+    if (!updates.length) return { ok: true };
+    let r = null;
+    try { r = api.demand?.updatePops?.(updates); } catch (e) { r = { success: false, error: String(e) }; }
+    if (!r?.success) return { ok: false, error: r?.error || "Could not restore commuter expansions after a failed delete." };
+    for (const item of reverted.revertedEntries || []) {
+      if (!item?.rec) continue;
+      item.rec.active = true;
+      delete item.rec.removedAt;
+    }
+    rebuildLedgerPointAdditions();
+    return { ok: true };
+  }
+
+  function deactivateAdjustmentsForRemovedPops(removedPopIds, removedPrimaryId = null) {
+    if (!removedPopIds?.size) return 0;
+    const now = Date.now();
+    const actionById = new Map((ledger.actions || []).filter(Boolean).map((action) => [String(action.id), action]));
+    let count = 0;
+    for (const rec of Object.values(ledger.adjustments || {})) {
+      if (!rec || rec.active === false || !removedPopIds.has(String(rec.popId))) continue;
+      rec.active = false;
+      rec.removedAt = now;
+      count++;
+
+      if (removedPrimaryId != null && String(rec.primaryId || "") !== String(removedPrimaryId)) {
+        const action = actionById.get(String(rec.actionId || ""));
+        if (action && action.active !== false) {
+          action.amount = Math.max(0, (Number(action.amount) || 0) - Math.max(0, Number(rec.delta) || 0));
+          if (!(action.amount > 0)) {
+            action.active = false;
+            action.removedAt = now;
+          }
+        }
+      }
+    }
+    return count;
+  }
+
   function removeDevelopmentForPoint(pointId) {
+    beginInternalDemandMutation();
+    try {
     const ids = Object.entries(ledger.pops || {}).filter(([, rec]) => rec?.active !== false && String(rec?.primaryId || "") === String(pointId)).map(([id]) => id);
-    const result = removeOwnedPops(ids);
-    if (!result.ok) return result;
+    const ownedIds = new Set(ids.map(String));
+    const adjustments = Object.entries(ledger.adjustments || {}).filter(([, rec]) => rec?.active !== false && String(rec?.primaryId || "") === String(pointId)).map(([key, rec]) => ({ key, rec }));
+    const externalAdjustments = adjustments.filter((item) => !ownedIds.has(String(item.rec?.popId)));
+
+    const reverted = revertAdjustments(externalAdjustments);
+    if (!reverted.ok) return reverted;
+
+    let result = { ok: true, removedCount: 0 };
+    if (ids.length) {
+      result = removeOwnedPops(ids);
+      if (!result.ok) {
+        const undo = undoRevertedAdjustments(reverted);
+        return undo.ok ? result : { ok: false, error: `${result.error}; adjustment rollback failed: ${undo.error}` };
+      }
+    }
+    const deactivatedOwnedAdjustments = deactivateAdjustmentsForRemovedPops(ownedIds, pointId);
+
     const now = Date.now();
     for (const a of ledger.actions || []) if (String(a?.pointId || "") === String(pointId) && a.active !== false) { a.active = false; a.removedAt = now; }
-    const live = api.gameState.getDemandData?.()?.points?.get(pointId);
-    if (ledger.points?.[pointId]?.created && live && (live.residents || 0) === 0 && (live.jobs || 0) === 0 && (live.popIds?.length || 0) === 0) {
-      try { api.demand?.removeDemandPoint?.(pointId); } catch {}
-    }
+    rebuildLedgerPointAdditions();
+    const cleanup = cleanupEmptyCreatedPoints(api.gameState.getDemandData?.());
     saveLedger();
     invalidatePreviews({ demand: true, ledgerState: true });
     refreshUi();
-    return result;
+    return {
+      ok: true,
+      removedCount: Number(result.removedCount || 0),
+      revertedCount: Number(reverted.revertedCount || 0) + deactivatedOwnedAdjustments,
+      removedPointCount: cleanup.removedCount,
+      cleanupErrors: cleanup.errors,
+    };
+    } finally {
+      endInternalDemandMutation();
+    }
   }
 
   function removeAllDevelopment() {
-    const result = removeOwnedPops(Object.entries(ledger.pops || {}).filter(([, rec]) => rec?.active !== false).map(([id]) => id));
-    if (!result.ok) return result;
-    const now = Date.now();
-    for (const a of ledger.actions || []) if (a && a.active !== false) { a.active = false; a.removedAt = now; }
-    const dd = api.gameState.getDemandData?.();
-    for (const [pointId, rec] of Object.entries(ledger.points || {})) {
-      if (!rec?.created) continue;
-      const live = dd?.points?.get(pointId);
-      if (live && (live.residents || 0) === 0 && (live.jobs || 0) === 0 && (live.popIds?.length || 0) === 0) {
-        try { api.demand?.removeDemandPoint?.(pointId); } catch {}
+    beginInternalDemandMutation();
+    try {
+    const ids = Object.entries(ledger.pops || {}).filter(([, rec]) => rec?.active !== false).map(([id]) => id);
+    const ownedIds = new Set(ids.map(String));
+    const adjustments = Object.entries(ledger.adjustments || {}).filter(([, rec]) => rec?.active !== false).map(([key, rec]) => ({ key, rec }));
+    const externalAdjustments = adjustments.filter((item) => !ownedIds.has(String(item.rec?.popId)));
+
+    const reverted = revertAdjustments(externalAdjustments);
+    if (!reverted.ok) return reverted;
+
+    let result = { ok: true, removedCount: 0 };
+    if (ids.length) {
+      result = removeOwnedPops(ids);
+      if (!result.ok) {
+        const undo = undoRevertedAdjustments(reverted);
+        return undo.ok ? result : { ok: false, error: `${result.error}; adjustment rollback failed: ${undo.error}` };
       }
     }
+    const deactivatedOwnedAdjustments = deactivateAdjustmentsForRemovedPops(ownedIds);
+
+    const now = Date.now();
+    for (const a of ledger.actions || []) if (a && a.active !== false) { a.active = false; a.removedAt = now; }
+    rebuildLedgerPointAdditions();
+    const cleanup = cleanupEmptyCreatedPoints(api.gameState.getDemandData?.());
     saveLedger();
     invalidatePreviews({ demand: true, ledgerState: true });
     refreshUi();
-    return result;
+    return {
+      ok: true,
+      removedCount: Number(result.removedCount || 0),
+      revertedCount: Number(reverted.revertedCount || 0) + deactivatedOwnedAdjustments,
+      removedPointCount: cleanup.removedCount,
+      cleanupErrors: cleanup.errors,
+    };
+    } finally {
+      endInternalDemandMutation();
+    }
   }
 
   let lastOverlaySource = null;
   let lastOverlayKey = null;
+
+  function existingConnectionsForPoint(dd, pointId) {
+    const id = String(pointId || "");
+    const point = looseMapGet(dd?.points, id);
+    if (!point) return [];
+    const totals = new Map();
+    for (const popId of point.popIds || []) {
+      const pop = looseMapGet(dd?.popsMap, popId);
+      const size = Math.max(0, Number(pop?.size) || 0);
+      if (!pop || !(size > 0)) continue;
+
+      let counterpartId = null;
+      let side = null;
+      if (String(pop.residenceId) === id) {
+        counterpartId = String(pop.jobId);
+        side = "work";
+      } else if (String(pop.jobId) === id) {
+        counterpartId = String(pop.residenceId);
+        side = "residential";
+      } else {
+        continue;
+      }
+      if (!counterpartId || counterpartId === id) continue;
+      const counterpart = looseMapGet(dd?.points, counterpartId);
+      if (!Array.isArray(counterpart?.location)) continue;
+      const type = side === "work" ? (specialPointKind(counterpartId) || "work") : "residential";
+      const key = `${side}:${counterpartId}`;
+      const rec = totals.get(key) || {
+        id: counterpartId,
+        size: 0,
+        side,
+        type,
+        location: [Number(counterpart.location[0]), Number(counterpart.location[1])],
+      };
+      rec.size += size;
+      totals.set(key, rec);
+    }
+    return [...totals.values()].sort((a, b) => b.size - a.size || a.id.localeCompare(b.id));
+  }
 
   function overlayRenderKey(s = uiStore.get()) {
     const pending = Array.isArray(s.pendingLocation) ? `${Number(s.pendingLocation[0])},${Number(s.pendingLocation[1])}` : "";
@@ -2559,10 +4242,24 @@
       s.infoMapVisible ? 1 : 0,
       s.mode || "",
       s.existingSide || "",
+      s.createSide || "",
+      s.createKind || "",
       s.selectedId || "",
       s.previewExistingId || "",
+      s.createReviewed ? 1 : 0,
+      s.reviewKey || "",
+      s.showExistingConnections ? 1 : 0,
       pending,
     ].join("|");
+  }
+
+  function overlayPointType(pointId, fallback, revealSpecial = false) {
+    if (revealSpecial) {
+      const kind = specialPointKind(pointId);
+      if (kind === "airport") return "airport";
+      if (kind === "university") return "university";
+    }
+    return fallback;
   }
 
   function overlayGeoJSON() {
@@ -2593,7 +4290,7 @@
             properties: {
               kind: "existing",
               pointId: sid,
-              pointType: radiusSide,
+              pointType: overlayPointType(sid, radiusSide, true),
               bubbleRadius: demandBubbleRadius(p, radiusSide),
               selected: sid === String(s.selectedId || "") ? 1 : 0,
             },
@@ -2604,18 +4301,81 @@
       return { type: "FeatureCollection", features };
     }
 
+    const createReviewActive = s.mode === "create" && isCurrentCreateReview(s);
+    const existingReviewActive = s.mode !== "create" && isCurrentExistingReview(s);
+    const reviewActive = createReviewActive || existingReviewActive;
+    const reviewById = reviewActive
+      ? new Map((s.reviewConnections || []).map((connection) => [String(connection.id), connection]))
+      : null;
+    const existingConnectionsActive = !reviewActive && s.mode !== "create" && !!s.showExistingConnections && !!s.selectedId;
+    const existingConnections = existingConnectionsActive ? existingConnectionsForPoint(dd, s.selectedId) : [];
+    const existingConnectionById = new Map();
+    if (existingConnectionsActive) {
+      for (const connection of existingConnections) {
+        const sid = String(connection.id);
+        if (!existingConnectionById.has(sid)) existingConnectionById.set(sid, connection);
+      }
+    }
+
     if (dd?.points) {
       for (const [id, p] of dd.points.entries()) {
         if (!Array.isArray(p?.location)) continue;
+        const sid = String(id);
         const residents = Number(p.residents || 0);
         const workers = Number(p.jobs || 0);
         let include = false;
         let radiusSide = residents >= workers ? "residential" : "work";
         let pointType = radiusSide;
+        let revealSpecial = false;
 
-        if (s.mode === "create") {
+        if (existingConnectionsActive) {
+          const connection = existingConnectionById.get(sid);
+          const isOrigin = sid === String(s.selectedId || "");
+          include = !!connection || isOrigin;
+          if (!include) continue;
+          if (connection) {
+            radiusSide = connection.side === "residential" ? "residential" : "work";
+            pointType = connection.type || radiusSide;
+            revealSpecial = connection.type === "university" || connection.type === "airport";
+          } else {
+            const selectedType = s.existingSide || existingPointType(p);
+            radiusSide = existingTypeSide(selectedType);
+            pointType = selectedType;
+            revealSpecial = selectedType === "university" || selectedType === "airport";
+          }
+        } else if (reviewActive) {
+          const connection = reviewById.get(sid);
+          const isOrigin = existingReviewActive && sid === String(s.selectedId || "");
+          include = !!connection || isOrigin;
+          if (!include) continue;
+
+          if (connection) {
+            radiusSide = connection.side === "residential" ? "residential" : "work";
+            const special = radiusSide === "work" ? specialPointKind(sid) : null;
+            pointType = special || radiusSide;
+            revealSpecial = !!special;
+          } else {
+            const selectedType = s.existingSide || existingPointType(p);
+            radiusSide = existingTypeSide(selectedType);
+            pointType = selectedType;
+            revealSpecial = selectedType === "university" || selectedType === "airport";
+          }
+        } else if (s.mode === "create") {
           include = residents > 0 || workers > 0;
           pointType = "neutral";
+          if (s.createSide === "residential" && !s.createKind && residents > 0) {
+            pointType = "residential";
+            radiusSide = "residential";
+          } else if (s.createSide === "work" && !s.createKind && workers > 0 && !specialPointKind(id)) {
+            pointType = "work";
+            radiusSide = "work";
+          } else if (s.createKind === "university" && workers > 0 && specialPointKind(id) === "university") {
+            pointType = "university";
+            radiusSide = "work";
+          } else if (s.createKind === "airport" && workers > 0 && specialPointKind(id) === "airport") {
+            pointType = "airport";
+            radiusSide = "work";
+          }
         } else if (!s.existingSide && s.mode === "normal") {
           include = residents > 0 || workers > 0;
           pointType = "neutral";
@@ -2624,21 +4384,72 @@
           pointType = "residential";
           radiusSide = "residential";
         } else if (s.existingSide === "work") {
-          include = workers > 0;
+          include = workers > 0 && !specialPointKind(id);
           pointType = "work";
+          radiusSide = "work";
+        } else if (s.existingSide === "university") {
+          include = workers > 0 && specialPointKind(id) === "university";
+          pointType = "university";
+          radiusSide = "work";
+        } else if (s.existingSide === "airport") {
+          include = workers > 0 && specialPointKind(id) === "airport";
+          pointType = "airport";
           radiusSide = "work";
         }
         if (!include) continue;
+        if (!reviewActive) revealSpecial = s.mode === "normal" ? (s.existingSide === "university" || s.existingSide === "airport") : false;
         features.push({
           type: "Feature",
           properties: {
             kind: "existing",
-            pointId: String(id),
-            pointType,
-            bubbleRadius: demandBubbleRadius(p, radiusSide),
-            selected: (String(id) === String(s.selectedId || "") || (s.mode === "create" && String(id) === String(s.previewExistingId || ""))) ? 1 : 0,
+            pointId: sid,
+            pointType: overlayPointType(id, pointType, revealSpecial),
+            bubbleRadius: existingConnectionsActive && existingConnectionById.has(sid)
+              ? flowBubbleRadius(existingConnectionById.get(sid).size)
+              : reviewActive && reviewById?.has(sid)
+                ? flowBubbleRadius(reviewById.get(sid).size)
+                : demandBubbleRadius(p, radiusSide),
+            selected: (sid === String(s.selectedId || "") || (s.mode === "create" && sid === String(s.previewExistingId || ""))) ? 1 : 0,
           },
           geometry: { type: "Point", coordinates: p.location },
+        });
+      }
+    }
+
+    if (existingConnectionsActive) {
+      const origin = looseMapGet(dd?.points, s.selectedId)?.location;
+      if (Array.isArray(origin)) {
+        for (const connection of existingConnections) {
+          if (!Array.isArray(connection?.location)) continue;
+          features.push({
+            type: "Feature",
+            properties: {
+              kind: "existing-connection",
+              connectionSide: connection.side,
+              connectionType: connection.type || connection.side,
+              flowSize: Math.max(1, Number(connection.size) || 1),
+            },
+            geometry: { type: "LineString", coordinates: [origin, connection.location] },
+          });
+        }
+      }
+    }
+
+    const reviewOrigin = createReviewActive
+      ? s.pendingLocation
+      : (existingReviewActive ? dd?.points?.get(String(s.selectedId))?.location : null);
+    if (Array.isArray(reviewOrigin)) {
+      for (const connection of s.reviewConnections || []) {
+        if (!Array.isArray(connection?.location)) continue;
+        features.push({
+          type: "Feature",
+          properties: {
+            kind: "review-connection",
+            connectionSide: connection.side,
+            connectionType: connection.type || connection.side,
+            flowSize: Math.max(1, Number(connection.size) || 1),
+          },
+          geometry: { type: "LineString", coordinates: [reviewOrigin, connection.location] },
         });
       }
     }
@@ -2655,7 +4466,6 @@
 
   const EMPTY_GEOJSON = { type: "FeatureCollection", features: [] };
   let demandReady = false;
-  let pointsNeedRefresh = true;
   let lifecycleEpoch = 0;
   let lifecycleCity = null;
 
@@ -2668,16 +4478,39 @@
   function overlayLayerSpecs() {
     return [
       {
+        id: CFG.EXISTING_CONNECTION_LAYER_ID,
+        type: "line",
+        source: CFG.SOURCE_ID,
+        filter: ["==", ["get", "kind"], "existing-connection"],
+        paint: {
+          "line-color": ["match", ["get", "connectionType"], "residential", "#60a5fa", "work", "#f59e0b", "university", "#4ade80", "airport", "#c084fc", "#d1d5db"],
+          "line-opacity": 0.58,
+          "line-width": ["interpolate", ["linear"], ["get", "flowSize"], 25, 1.1, 100, 1.8, 500, 3.2, 1000, 4.5],
+        },
+      },
+      {
+        id: CFG.CONNECTION_LAYER_ID,
+        type: "line",
+        source: CFG.SOURCE_ID,
+        filter: ["==", ["get", "kind"], "review-connection"],
+        paint: {
+          "line-color": ["match", ["get", "connectionType"], "residential", "#60a5fa", "work", "#f59e0b", "university", "#4ade80", "airport", "#c084fc", "#d1d5db"],
+          "line-opacity": 0.78,
+          "line-width": ["interpolate", ["linear"], ["get", "flowSize"], 25, 1.5, 100, 2.5, 500, 4.5, 1000, 6],
+          "line-dasharray": [2, 2],
+        },
+      },
+      {
         id: CFG.CONTEXT_LAYER_ID,
         type: "circle",
         source: CFG.SOURCE_ID,
         filter: ["==", ["get", "kind"], "existing"],
         paint: {
           "circle-radius": ["+", ["get", "bubbleRadius"], ["case", ["==", ["get", "selected"], 1], 7.5, 0]],
-          "circle-color": ["match", ["get", "pointType"], "residential", "#3b82f6", "work", "#f59e0b", "#6b7280"],
+          "circle-color": ["match", ["get", "pointType"], "residential", "#3b82f6", "work", "#f59e0b", "university", "#22c55e", "airport", "#a855f7", "#6b7280"],
           "circle-opacity": ["case", ["==", ["get", "selected"], 1], 0.60, 0.32],
           "circle-stroke-width": ["case", ["==", ["get", "selected"], 1], 4, 2],
-          "circle-stroke-color": ["case", ["==", ["get", "selected"], 1], "#ef4444", ["match", ["get", "pointType"], "residential", "#60a5fa", "work", "#f59e0b", "#9ca3af"]],
+          "circle-stroke-color": ["case", ["==", ["get", "selected"], 1], "#ef4444", ["match", ["get", "pointType"], "residential", "#60a5fa", "work", "#f59e0b", "university", "#4ade80", "airport", "#c084fc", "#9ca3af"]],
           "circle-stroke-opacity": ["case", ["==", ["get", "selected"], 1], 1, 0.78],
         },
       },
@@ -2719,6 +4552,8 @@
     }
 
     const ready = !!map.getSource?.(CFG.SOURCE_ID) &&
+      !!map.getLayer?.(CFG.EXISTING_CONNECTION_LAYER_ID) &&
+      !!map.getLayer?.(CFG.CONNECTION_LAYER_ID) &&
       !!map.getLayer?.(CFG.CONTEXT_LAYER_ID) &&
       !!map.getLayer?.(CFG.PENDING_LAYER_ID);
     if (ready) {
@@ -2757,7 +4592,8 @@
     demandReady = false;
     ledger = newLedger();
     loadedLedgerKey = null;
-    uiStore.set({ mode: "normal", existingSide: null, createSide: null, selectedId: null, previewExistingId: null, selectedAmount: null, pendingLocation: null, infoOpen: false, status, busy: false });
+    lastPlanningDemandSignature = null;
+    uiStore.set({ mode: "normal", existingSide: null, createSide: null, createKind: null, createReviewed: false, reviewKey: null, reviewConnections: [], showExistingConnections: false, selectedId: null, previewExistingId: null, selectedAmount: null, pendingLocation: null, pendingLandConversion: null, pendingAirportCluster: null, infoOpen: false, status, busy: false });
     clearOverlay();
     lastOverlaySource = null;
     lastOverlayKey = null;
@@ -2765,7 +4601,7 @@
   }
 
   const uiStore = (() => {
-    let state = { mode: "normal", existingSide: null, createSide: null, selectedId: null, previewExistingId: null, selectedAmount: null, pendingLocation: null, panelOpen: false, infoOpen: false, infoMapVisible: false, status: "", busy: false, revision: 0 };
+    let state = { mode: "normal", existingSide: null, createSide: null, createKind: null, createReviewed: false, reviewKey: null, reviewConnections: [], showExistingConnections: false, selectedId: null, previewExistingId: null, selectedAmount: null, pendingLocation: null, pendingLandConversion: null, pendingAirportCluster: null, panelOpen: false, infoOpen: false, infoMapVisible: false, status: "", busy: false, revision: 0 };
     const subs = new Set();
     return {
       get: () => state,
@@ -2917,21 +4753,7 @@
     return bestId;
   }
 
-  function sideForPoint(p) {
-    const r = Number(p?.residents || 0) > 0;
-    const w = Number(p?.jobs || 0) > 0;
-    if (r && !w) return "residential";
-    if (w && !r) return "work";
-    return null;
-  }
-
-  function dominantLiveSide(p) {
-    const residents = Math.max(0, Number(p?.residents || 0));
-    const workers = Math.max(0, Number(p?.jobs || 0));
-    return residents >= workers ? "residential" : "work";
-  }
-
-  function placementLayerRole(layerId, sourceLayer) {
+  function placementLayerRole(layerId, sourceLayer, filter = null) {
     const sl = String(sourceLayer || "").toLowerCase();
     if (sl === "water" || sl === "ocean_foundations") return "water";
     if (sl === "parks" || sl === "park") return "green";
@@ -2940,6 +4762,11 @@
     if (/water|ocean|lake|river/.test(id)) return "water";
     if (/airport|aerodrome|aero/.test(id)) return "airport";
     if (/park|green|forest|wood|grass/.test(id)) return "green";
+    let filterText = "";
+    try { filterText = JSON.stringify(filter || "").toLowerCase(); } catch {}
+    if (/airport|aerodrome|aeroway/.test(filterText)) return "airport";
+    if (/park|forest|wood|grass|green/.test(filterText)) return "green";
+    if (/water|ocean|lake|river/.test(filterText)) return "water";
     return null;
   }
 
@@ -2957,7 +4784,7 @@
       try { features = map.queryRenderedFeatures(point) || []; } catch { return null; }
     }
     let best = null;
-    const priority = { water: 2, airport: 1 };
+    const priority = { water: 3, airport: 2, green: 1 };
     for (const f of features) {
       const layerType = String(f?.layer?.type || "").toLowerCase();
       const geomType = String(f?.geometry?.type || "").toLowerCase();
@@ -2966,10 +4793,79 @@
         (layerType === "line" && geomType.includes("line"));
       if (!physical) continue;
       const role = placementLayerRole(f?.layer?.id, f?.layer?.["source-layer"] || f?.sourceLayer);
-      if (role !== "water" && role !== "airport") continue;
+      if (role !== "water" && role !== "airport" && role !== "green") continue;
       if (!best || priority[role] > priority[best]) best = role;
     }
     return best;
+  }
+
+  function placementRoleForLocation(location) {
+    const map = api.utils.getMap?.();
+    if (!map || !Array.isArray(location)) return null;
+    let point = null;
+    try { point = map.project({ lng: location[0], lat: location[1] }); }
+    catch { try { point = map.project(location); } catch { return null; } }
+    return placementBlockAt(map, point);
+  }
+
+  function sourceLayerContainsLocation(map, layerId, location) {
+    if (!map?.querySourceFeatures || !map?.getLayer || !Array.isArray(location)) return null;
+    let layer = null;
+    try { layer = map.getLayer(layerId); } catch {}
+    if (!layer?.source) return null;
+    const options = {};
+    const sourceLayer = layer["source-layer"];
+    if (sourceLayer) options.sourceLayer = sourceLayer;
+    if (layer.filter) options.filter = layer.filter;
+    let features = [];
+    try { features = map.querySourceFeatures(layer.source, options) || []; } catch { return null; }
+    for (const feature of features) {
+      const d = geometryDistanceFromLocation(location, feature?.geometry);
+      if (Number.isFinite(d) && d <= 0.5) return true;
+    }
+    return false;
+  }
+
+  function detectLandConversion(location) {
+    const map = api.utils.getMap?.();
+    if (!map || !Array.isArray(location)) return false;
+    for (const layerId of ["parks-large", "parks-small"]) {
+      if (sourceLayerContainsLocation(map, layerId, location) === true) return true;
+    }
+    return placementRoleForLocation(location) === "green";
+  }
+
+  function requiresLandConversion(location) {
+    return detectLandConversion(location);
+  }
+
+  function newPointPriceMultiplier(location, kind = null, landConversion = null, airportCluster = null) {
+    const converted = landConversion == null ? requiresLandConversion(location) : !!landConversion;
+    const inAirportCluster = kind === "airport"
+      ? (airportCluster == null ? airportClusterStatus(location).cluster : !!airportCluster)
+      : null;
+    let multiplier = CFG.NEW_POINT_PRICE_MULTIPLIER;
+    if (converted) multiplier += CFG.LAND_CONVERSION_PRICE_SURCHARGE;
+    multiplier += specialCreatePriceSurcharge(kind);
+    if (kind === "airport" && !inAirportCluster) multiplier += CFG.INDEPENDENT_AIRPORT_PRICE_SURCHARGE;
+    return multiplier;
+  }
+
+  function newPointPriceParts(kind = null, landConversion = false, airportCluster = null) {
+    const parts = [{ label: "New point", surcharge: CFG.NEW_POINT_PRICE_MULTIPLIER - 1 }];
+    if (landConversion) parts.push({ label: "Land conversion", surcharge: CFG.LAND_CONVERSION_PRICE_SURCHARGE });
+    const special = specialCreatePriceSurcharge(kind);
+    if (special > 0) parts.push({ label: kind === "airport" ? "Airport" : "University", surcharge: special });
+    if (kind === "airport" && airportCluster === false) parts.push({ label: "Independent airport location", surcharge: CFG.INDEPENDENT_AIRPORT_PRICE_SURCHARGE });
+    return parts.filter((part) => part.surcharge > 0);
+  }
+
+  function existingPriceParts(pointId, side) {
+    if (side !== "work") return [];
+    const kind = specialPointKind(pointId);
+    const multiplier = specialExpansionPriceMultiplier(kind);
+    if (!kind || multiplier <= 1) return [];
+    return [{ label: kind === "airport" ? "Airport" : "University", surcharge: multiplier - 1 }];
   }
 
   function boundsArray(raw) {
@@ -3083,42 +4979,246 @@
       const { id, p } = rec;
       if (!Array.isArray(p?.location)) continue;
       const pointId = String(id);
-      if (pointId.startsWith(CFG.NEW_POINT_PREFIX) || ledger.points?.[pointId]?.created) continue;
+      if (isDemandDeveloperPointId(pointId)) continue;
       if (haversine(location, p.location) <= maxDistanceM) return true;
     }
     return false;
   }
 
-  function placementBlockReason(location) {
+  function nearestDemandPointDistance(location, maxDistanceM = Infinity, predicate = null) {
+    const dd = api.gameState.getDemandData?.();
+    if (!dd?.points?.size || !Array.isArray(location)) return Infinity;
+    const searchRadius = Number.isFinite(maxDistanceM) ? maxDistanceM : 200000;
+    let best = Infinity;
+    for (const rec of demandGeoCandidates(location, searchRadius, dd)) {
+      if (!Array.isArray(rec?.p?.location)) continue;
+      if (predicate && !predicate(rec.id, rec.p)) continue;
+      const d = haversine(location, rec.p.location);
+      if (d < best) best = d;
+    }
+    return best;
+  }
+
+  function anyDemandPointWithin(location, maxDistanceM) {
+    return nearestDemandPointDistance(location, maxDistanceM) < maxDistanceM;
+  }
+
+  function localMeters(location, coord) {
+    if (!Array.isArray(location) || !Array.isArray(coord)) return null;
+    const lon0 = Number(location[0]), lat0 = Number(location[1]);
+    const lon = Number(coord[0]), lat = Number(coord[1]);
+    if (![lon0, lat0, lon, lat].every(Number.isFinite)) return null;
+    const cos = Math.max(0.01, Math.cos(lat0 * Math.PI / 180));
+    return [(lon - lon0) * 111320 * cos, (lat - lat0) * 111320];
+  }
+
+  function segmentDistanceFromLocation(location, a, b) {
+    const pa = localMeters(location, a), pb = localMeters(location, b);
+    if (!pa || !pb) return Infinity;
+    const vx = pb[0] - pa[0], vy = pb[1] - pa[1];
+    const len2 = vx * vx + vy * vy;
+    if (len2 <= 1e-9) return Math.hypot(pa[0], pa[1]);
+    const t = Math.max(0, Math.min(1, -(pa[0] * vx + pa[1] * vy) / len2));
+    return Math.hypot(pa[0] + t * vx, pa[1] + t * vy);
+  }
+
+  function ringContainsLocation(location, ring) {
+    if (!Array.isArray(ring) || ring.length < 3 || !Array.isArray(location)) return false;
+    const x = Number(location[0]), y = Number(location[1]);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return false;
+    let inside = false;
+    for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+      const xi = Number(ring[i]?.[0]), yi = Number(ring[i]?.[1]);
+      const xj = Number(ring[j]?.[0]), yj = Number(ring[j]?.[1]);
+      if (![xi, yi, xj, yj].every(Number.isFinite)) continue;
+      const crosses = (yi > y) !== (yj > y) && x < (xj - xi) * (y - yi) / ((yj - yi) || 1e-12) + xi;
+      if (crosses) inside = !inside;
+    }
+    return inside;
+  }
+
+  function lineDistanceFromLocation(location, coords) {
+    if (!Array.isArray(coords) || coords.length === 0) return Infinity;
+    if (coords.length === 1) return haversine(location, coords[0]);
+    let best = Infinity;
+    for (let i = 1; i < coords.length; i++) best = Math.min(best, segmentDistanceFromLocation(location, coords[i - 1], coords[i]));
+    return best;
+  }
+
+  function polygonDistanceFromLocation(location, rings) {
+    if (!Array.isArray(rings) || !rings.length) return Infinity;
+    const insideOuter = ringContainsLocation(location, rings[0]);
+    const insideHole = insideOuter && rings.slice(1).some((ring) => ringContainsLocation(location, ring));
+    if (insideOuter && !insideHole) return 0;
+    let best = Infinity;
+    for (const ring of rings) best = Math.min(best, lineDistanceFromLocation(location, ring));
+    return best;
+  }
+
+  function geometryDistanceFromLocation(location, geometry) {
+    const type = String(geometry?.type || "");
+    const c = geometry?.coordinates;
+    if (type === "Point") return Array.isArray(c) ? haversine(location, c) : Infinity;
+    if (type === "MultiPoint") return Math.min(Infinity, ...(c || []).map((point) => haversine(location, point)));
+    if (type === "LineString") return lineDistanceFromLocation(location, c);
+    if (type === "MultiLineString") return Math.min(Infinity, ...(c || []).map((line) => lineDistanceFromLocation(location, line)));
+    if (type === "Polygon") return polygonDistanceFromLocation(location, c);
+    if (type === "MultiPolygon") return Math.min(Infinity, ...(c || []).map((poly) => polygonDistanceFromLocation(location, poly)));
+    if (type === "GeometryCollection") return Math.min(Infinity, ...(geometry?.geometries || []).map((g) => geometryDistanceFromLocation(location, g)));
+    return Infinity;
+  }
+
+  function hasMappedAirportGeometryLayer(map) {
+    if (!map) return false;
+    let layers = [];
+    try { layers = map.getStyle?.()?.layers || []; } catch { return false; }
+    for (const layer of layers) {
+      if (placementLayerRole(layer?.id, layer?.["source-layer"], layer?.filter) !== "airport") continue;
+      const type = String(layer?.type || "").toLowerCase();
+      if (type === "fill" || type === "fill-extrusion" || type === "line") return true;
+    }
+    return false;
+  }
+
+  function sourceAirportDistance(map, location, maxDistanceM = 500) {
+    if (!map?.querySourceFeatures || !Array.isArray(location)) return Infinity;
+    let layers = [];
+    try { layers = map.getStyle?.()?.layers || []; } catch { return Infinity; }
+    const seen = new Set();
+    let best = Infinity;
+    for (const layer of layers) {
+      if (placementLayerRole(layer?.id, layer?.["source-layer"], layer?.filter) !== "airport" || !layer?.source) continue;
+      const sourceLayer = layer["source-layer"] || "";
+      const filterKey = layer.filter ? JSON.stringify(layer.filter) : "";
+      const key = `${layer.source}|${sourceLayer}|${filterKey}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const options = {};
+      if (sourceLayer) options.sourceLayer = sourceLayer;
+      if (layer.filter) options.filter = layer.filter;
+      let features = [];
+      try { features = map.querySourceFeatures(layer.source, options) || []; } catch { continue; }
+      for (const feature of features) {
+        const d = geometryDistanceFromLocation(location, feature?.geometry);
+        if (Number.isFinite(d)) best = Math.min(best, d);
+      }
+    }
+    return best <= maxDistanceM ? best : Infinity;
+  }
+
+  function renderedAirportDistance(map, location, maxDistanceM = 500) {
+    if (!map || !Array.isArray(location)) return Infinity;
+    let center;
+    try { center = map.project({ lng: location[0], lat: location[1] }); }
+    catch { try { center = map.project(location); } catch { return Infinity; } }
+    if (!Number.isFinite(center?.x) || !Number.isFinite(center?.y)) return Infinity;
+
+    const lat = Number(location[1]);
+    const lon = Number(location[0]);
+    const dLat = maxDistanceM / 111320;
+    const dLon = maxDistanceM / Math.max(20000, 111320 * Math.cos(lat * Math.PI / 180));
+    const samples = [[lon + dLon, lat], [lon - dLon, lat], [lon, lat + dLat], [lon, lat - dLat]];
+    let radiusPx = 4;
+    for (const sample of samples) {
+      try {
+        const sp = map.project({ lng: sample[0], lat: sample[1] });
+        const dx = Number(sp?.x) - Number(center.x);
+        const dy = Number(sp?.y) - Number(center.y);
+        if (Number.isFinite(dx) && Number.isFinite(dy)) radiusPx = Math.max(radiusPx, Math.hypot(dx, dy));
+      } catch {}
+    }
+    radiusPx = Math.max(4, Math.min(1200, radiusPx + 3));
+
+    let features = [];
+    try {
+      features = map.queryRenderedFeatures([
+        [center.x - radiusPx, center.y - radiusPx],
+        [center.x + radiusPx, center.y + radiusPx],
+      ]) || [];
+    } catch { return Infinity; }
+
+    let best = Infinity;
+    for (const f of features) {
+      if (placementLayerRole(f?.layer?.id, f?.layer?.["source-layer"] || f?.sourceLayer) !== "airport") continue;
+      const d = geometryDistanceFromLocation(location, f?.geometry);
+      if (Number.isFinite(d)) best = Math.min(best, d);
+    }
+    return best <= maxDistanceM ? best : Infinity;
+  }
+
+  function airportClusterStatus(location) {
+    const map = api.utils.getMap?.();
+    if (!map || !Array.isArray(location)) return { cluster: false, airportDistance: Infinity, nearestOtherDemand: Infinity };
+
+    // Mod-created AIR points never extend the airport-placement boundary.
+    const mappedAirportDistance = Math.min(
+      sourceAirportDistance(map, location, 500),
+      renderedAirportDistance(map, location, 500)
+    );
+    const mapHasAirportGeometry = hasMappedAirportGeometryLayer(map);
+    const nativeAirPointDistance = mapHasAirportGeometry
+      ? Infinity
+      : nearestDemandPointDistance(location, 500, (id) =>
+          specialPointKind(id) === "airport" && !isDemandDeveloperPointId(String(id))
+        );
+    const airportDistance = Number.isFinite(mappedAirportDistance)
+      ? mappedAirportDistance
+      : nativeAirPointDistance;
+
+    if (!Number.isFinite(airportDistance)) {
+      return { cluster: false, airportDistance: Infinity, nearestOtherDemand: Infinity };
+    }
+
+    const nearestOtherDemand = nearestDemandPointDistance(
+      location,
+      500,
+      (id) => specialPointKind(id) !== "airport"
+    );
+    return { cluster: nearestOtherDemand >= airportDistance, airportDistance, nearestOtherDemand };
+  }
+
+  function placementBlockReason(location, createKind = null) {
     const map = api.utils.getMap?.();
     if (!map || !Array.isArray(location)) return null;
     const bounds = playableMapBounds(map);
     if (bounds && !locationInBounds(location, bounds)) return "Can't place a point outside the playable map.";
-    if (!hasNativeDemandAnchorNearby(location)) return "New points must be within 5 km of an original demand point.";
+
     let point = null;
     try { point = map.project({ lng: location[0], lat: location[1] }); } catch {
       try { point = map.project(location); } catch { return null; }
     }
     const role = placementBlockAt(map, point);
     if (role === "water") return "Can't place a point on water.";
-    if (role === "airport") return "Can't place a point on airport ground.";
+    if (role === "airport" && createKind !== "airport") return "Can't place this point on airport ground.";
+
+    if (createKind === "airport") {
+      const airport = airportClusterStatus(location);
+      if (Number.isFinite(airport.airportDistance)) {
+        if (!airport.cluster) return "Airport expansion can't cross a closer demand point.";
+      } else if (anyDemandPointWithin(location, CFG.STANDALONE_AIRPORT_CLEARANCE_M)) {
+        return "A standalone Airport point must be at least 2 km from every demand point.";
+      }
+    } else if (!hasNativeDemandAnchorNearby(location)) {
+      return "New points must be within 5 km of an original demand point.";
+    }
 
     const place = locationHeaderParts(location);
-    if (place?.title === "Area" && areaFallbackOutsideDemandFootprint(location)) {
+    if (createKind !== "airport" && place?.title === "Area" && areaFallbackOutsideDemandFootprint(location)) {
       return "Can't place a point outside the mapped area.";
     }
     return null;
   }
 
   function developedSideForPoint(pointId, p = null) {
+    const special = specialPointKind(pointId);
+    if (special && Number(p?.jobs || 0) > 0) return special;
     const g = activeDevelopmentGroups().find((x) => String(x.pointId) === String(pointId));
-    if (!g) return sideForPoint(p) || "residential";
+    if (!g) return existingPointType(p);
     const addedResidents = Number(g.residents || 0);
     const addedWorkers = Number(g.workers || 0);
     if (addedResidents > addedWorkers) return "residential";
     if (addedWorkers > addedResidents) return "work";
-    if (Number(p?.residents || 0) >= Number(p?.jobs || 0)) return "residential";
-    return "work";
+    return existingPointType(p);
   }
 
   function openPointForImprovement(pointId) {
@@ -3130,12 +5230,14 @@
       return false;
     }
     uiStore.set({
+      ...clearCreateReviewState(),
       infoOpen: false,
       infoMapVisible: false,
       mode: "normal",
       createSide: null,
       pendingLocation: null,
       existingSide: developedSideForPoint(id, p),
+      showExistingConnections: false,
       selectedId: id,
       selectedAmount: CFG.STEP,
       status: "",
@@ -3143,6 +5245,161 @@
     refreshOverlay();
     focusDemandPoint(id);
     return true;
+  }
+
+  let reviewedPlanCache = null;
+  function rememberReviewedPlan(key, plan) {
+    reviewedPlanCache = key && plan?.ok ? { key, demandRevision, plan } : null;
+  }
+  function reviewedPlanForKey(key) {
+    if (!key || !reviewedPlanCache || reviewedPlanCache.key !== key || reviewedPlanCache.demandRevision !== demandRevision) return null;
+    return reviewedPlanCache.plan;
+  }
+  function clearReviewedPlanCache() { reviewedPlanCache = null; }
+
+  function clearCreateReviewState() {
+    return { createReviewed: false, reviewKey: null, reviewConnections: [] };
+  }
+
+  function createReviewKey(location, side, amount, createKind = null, landConversion = null, airportCluster = null) {
+    if (!Array.isArray(location) || !side || !DEVELOPMENT_AMOUNTS.includes(amount)) return null;
+    return [
+      demandRevision,
+      Number(location[0]).toFixed(6),
+      Number(location[1]).toFixed(6),
+      side,
+      createKind || "normal",
+      landConversion == null ? "land:?" : `land:${landConversion ? 1 : 0}`,
+      airportCluster == null ? "airport:?" : `airport:${airportCluster ? 1 : 0}`,
+      amount,
+    ].join("|");
+  }
+
+  function currentCreateReviewKey(s = uiStore.get()) {
+    return s.mode === "create"
+      ? createReviewKey(s.pendingLocation, s.createSide, s.selectedAmount, s.createKind, s.pendingLandConversion, s.pendingAirportCluster)
+      : null;
+  }
+
+  function isCurrentCreateReview(s = uiStore.get()) {
+    const key = currentCreateReviewKey(s);
+    return !!key && s.createReviewed === true && s.reviewKey === key;
+  }
+
+  function existingReviewKey(pointId, side, amount) {
+    if (!pointId || !side || !DEVELOPMENT_AMOUNTS.includes(amount)) return null;
+    return [demandRevision, "existing", String(pointId), side, amount].join("|");
+  }
+
+  function currentExistingReviewKey(s = uiStore.get()) {
+    if (s.mode === "create" || !s.selectedId || !s.existingSide) return null;
+    return existingReviewKey(s.selectedId, existingTypeSide(s.existingSide), s.selectedAmount);
+  }
+
+  function isCurrentExistingReview(s = uiStore.get()) {
+    const key = currentExistingReviewKey(s);
+    return !!key && s.createReviewed === true && s.reviewKey === key;
+  }
+
+  function overlappingDemandPoint(location, dd) {
+    let nearest = null;
+    let distance = Infinity;
+    for (const rec of demandGeoCandidates(location, 15, dd)) {
+      const p = rec?.p;
+      if (!Array.isArray(p?.location)) continue;
+      const d = haversine(location, p.location);
+      if (d < distance) {
+        distance = d;
+        nearest = { id: String(rec.id), distance };
+      }
+    }
+    return nearest && nearest.distance <= 15 ? nearest : null;
+  }
+
+  function reviewConnectionsForPlan(plan) {
+    const totals = new Map();
+    const counterpartSide = plan.side === "residential" ? "work" : "residential";
+    for (const flow of plan.flows || []) {
+      const id = String(plan.side === "residential" ? flow.jobId : flow.residenceId);
+      totals.set(id, (totals.get(id) || 0) + (Number(flow.size) || 0));
+    }
+    const connections = [];
+    for (const [id, size] of totals.entries()) {
+      const point = plan.before?.points?.get(id) || plan.planned?.points?.get(id);
+      if (!Array.isArray(point?.location)) continue;
+      const connectionType = counterpartSide === "work" ? (specialPointKind(id) || "work") : "residential";
+      connections.push({ id, size, side: counterpartSide, type: connectionType, location: [Number(point.location[0]), Number(point.location[1])] });
+    }
+    connections.sort((a, b) => b.size - a.size || a.id.localeCompare(b.id));
+    return connections;
+  }
+
+  function prepareCreateReview(side, amount, createKind = null) {
+    const s = uiStore.get();
+    const dd = api.gameState.getDemandData?.();
+    if (!dd || !Array.isArray(s.pendingLocation)) return;
+
+    const placementError = placementBlockReason(s.pendingLocation, createKind);
+    if (placementError) {
+      uiStore.set({ ...clearCreateReviewState(), pendingLocation: null, pendingLandConversion: null, pendingAirportCluster: null, selectedAmount: null, status: placementError });
+      refreshOverlay();
+      return;
+    }
+
+    const overlap = overlappingDemandPoint(s.pendingLocation, dd);
+    if (overlap) {
+      uiStore.set({ ...clearCreateReviewState(), previewExistingId: overlap.id, status: "There's already a demand point here. Use Develop or choose another location." });
+      refreshOverlay();
+      return;
+    }
+
+    const plan = planDevelopment(dd, { location: s.pendingLocation, landConversion: s.pendingLandConversion, airportCluster: s.pendingAirportCluster }, side, amount, true, createKind);
+    if (!plan.ok) {
+      uiStore.set({ ...clearCreateReviewState(), status: plan.error });
+      refreshOverlay();
+      return;
+    }
+
+    const connections = reviewConnectionsForPlan(plan);
+    const key = createReviewKey(s.pendingLocation, side, amount, createKind, s.pendingLandConversion, s.pendingAirportCluster);
+    rememberReviewedPlan(key, plan);
+    const commuterCount = connections.reduce((sum, connection) => sum + connection.size, 0);
+    uiStore.set({
+      createReviewed: true,
+      reviewKey: key,
+      reviewConnections: connections,
+      showExistingConnections: false,
+      status: connections.length
+        ? `Reviewing ${connections.length} planned connection${connections.length === 1 ? "" : "s"} for ${Math.round(commuterCount).toLocaleString()} commuters. Confirm Build to create the point.`
+        : "Plan reviewed. Confirm Build to create the point.",
+    });
+    refreshOverlay();
+  }
+
+  function prepareExistingReview(id, side, amount) {
+    const dd = api.gameState.getDemandData?.();
+    const point = dd?.points?.get(String(id));
+    if (!dd || !point) return;
+    const plan = planDevelopment(dd, point, side, amount, false);
+    if (!plan.ok) {
+      uiStore.set({ ...clearCreateReviewState(), status: plan.error });
+      refreshOverlay();
+      return;
+    }
+    const connections = reviewConnectionsForPlan(plan);
+    const key = existingReviewKey(id, side, amount);
+    rememberReviewedPlan(key, plan);
+    const commuterCount = connections.reduce((sum, connection) => sum + connection.size, 0);
+    uiStore.set({
+      createReviewed: true,
+      reviewKey: key,
+      reviewConnections: connections,
+      showExistingConnections: false,
+      status: connections.length
+        ? `Reviewing ${connections.length} planned connection${connections.length === 1 ? "" : "s"} for ${Math.round(commuterCount).toLocaleString()} commuters.`
+        : "Plan reviewed.",
+    });
+    refreshOverlay();
   }
 
   function mapClickHandler(e) {
@@ -3162,28 +5419,33 @@
 
     if (s.mode === "create") {
       if (contextId && dd?.points?.has(contextId)) {
-        uiStore.set({ previewExistingId: contextId, status: "" });
+        uiStore.set({ ...clearCreateReviewState(), previewExistingId: contextId, status: "" });
         refreshOverlay();
         return;
       }
       if (!s.createSide) {
-        uiStore.set({ status: "" });
+        uiStore.set({ ...clearCreateReviewState(), status: "" });
         refreshOverlay();
         return;
       }
       const pendingLocation = [e.lngLat.lng, e.lngLat.lat];
-      const reason = placementBlockReason(pendingLocation);
+      const pendingLandConversion = detectLandConversion(pendingLocation);
+      const pendingAirportCluster = s.createKind === "airport" ? airportClusterStatus(pendingLocation).cluster : null;
+      const reason = placementBlockReason(pendingLocation, s.createKind);
       if (reason) {
-        uiStore.set({ previewExistingId: null, pendingLocation: null, selectedId: null, selectedAmount: null, status: reason });
+        uiStore.set({ ...clearCreateReviewState(), previewExistingId: null, pendingLocation: null, pendingLandConversion: null, pendingAirportCluster: null, selectedId: null, selectedAmount: null, status: reason });
         refreshOverlay();
         return;
       }
       uiStore.set({
+        ...clearCreateReviewState(),
         pendingLocation,
+        pendingLandConversion,
+        pendingAirportCluster,
         selectedId: null,
         previewExistingId: null,
         selectedAmount: CFG.STEP,
-        status: "Location set.",
+        status: "",
       });
       refreshOverlay();
       return;
@@ -3191,10 +5453,14 @@
 
     if (contextId && dd?.points?.has(contextId)) {
       const p = dd.points.get(contextId);
-      const side = s.existingSide || dominantLiveSide(p);
-      uiStore.set({ existingSide: side, selectedId: contextId, previewExistingId: null, selectedAmount: CFG.STEP, status: "" });
+      const type = s.existingSide || existingPointType(p);
+      if (pointMatchesExistingType(p, type)) {
+        uiStore.set({ ...clearCreateReviewState(), existingSide: type, showExistingConnections: false, selectedId: contextId, previewExistingId: null, selectedAmount: CFG.STEP, status: "" });
+      } else {
+        uiStore.set({ showExistingConnections: false, selectedId: null, previewExistingId: null, selectedAmount: null, status: "" });
+      }
     } else {
-      uiStore.set({ selectedId: null, previewExistingId: null, selectedAmount: null, status: "" });
+      uiStore.set({ showExistingConnections: false, selectedId: null, previewExistingId: null, selectedAmount: null, status: "" });
     }
     refreshOverlay();
   }
@@ -3212,17 +5478,18 @@
   }
 
   const existingPriceCache = new Map();
-  function existingPriceKey(id) {
-    return `${demandRevision}|${id}`;
+  function existingPriceKey(id, side, multiplier) {
+    return `${demandRevision}|${id}|${side || ""}|${multiplier}`;
   }
-  function priceCurveForExisting(id) {
-    const key = existingPriceKey(id);
+  function priceCurveForExisting(id, side) {
+    const multiplier = side === "work" ? specialExpansionPriceMultiplier(specialPointKind(id)) : 1;
+    const key = existingPriceKey(id, side, multiplier);
     const cached = existingPriceCache.get(key);
     if (cached) return cached;
     const dd = api.gameState.getDemandData();
     const p = dd?.points.get(id);
     if (!dd || !p) return null;
-    const q = quoteDevelopmentPrice(dd, p.location, MAX_DEVELOPMENT_AMOUNT, false);
+    const q = quoteDevelopmentPrice(dd, p.location, MAX_DEVELOPMENT_AMOUNT, false, multiplier);
     if (!q.ok) return null;
     const curve = Object.fromEntries(DEVELOPMENT_AMOUNTS.map((amount) => [amount, { ok: true, totalCost: q.cumulative[amount] }]));
     existingPriceCache.set(key, curve);
@@ -3230,21 +5497,24 @@
     return curve;
   }
   function previewForExisting(id, side, amount) {
-    return priceCurveForExisting(id)?.[amount] || null;
+    return priceCurveForExisting(id, side)?.[amount] || null;
   }
 
   const createPriceCache = new Map();
-  function createPriceKey(location) {
-    return `${demandRevision}|${location?.[0]?.toFixed?.(5) || ""}|${location?.[1]?.toFixed?.(5) || ""}`;
+  function createPriceKey(location, createKind = null, landConversion = null, airportCluster = null) {
+    const land = landConversion == null ? (requiresLandConversion(location) ? 1 : 0) : (landConversion ? 1 : 0);
+    return `${demandRevision}|${location?.[0]?.toFixed?.(5) || ""}|${location?.[1]?.toFixed?.(5) || ""}|${createKind || "normal"}|land:${land}|airport:${airportCluster == null ? "?" : airportCluster ? 1 : 0}`;
   }
-  function priceCurveForCreate(location) {
+  function priceCurveForCreate(location, createKind = null, landConversion = null, airportCluster = null) {
     if (!Array.isArray(location)) return null;
-    const key = createPriceKey(location);
+    const key = createPriceKey(location, createKind, landConversion, airportCluster);
     const cached = createPriceCache.get(key);
     if (cached) return cached;
     const dd = api.gameState.getDemandData();
     if (!dd) return null;
-    const q = quoteDevelopmentPrice(dd, location, MAX_DEVELOPMENT_AMOUNT, true);
+    const multiplier = newPointPriceMultiplier(location, createKind, landConversion, airportCluster);
+    const followupMultiplier = specialExpansionPriceMultiplier(createKind);
+    const q = quoteDevelopmentPrice(dd, location, MAX_DEVELOPMENT_AMOUNT, true, multiplier, followupMultiplier);
     if (!q.ok) return null;
     const curve = Object.fromEntries(DEVELOPMENT_AMOUNTS.map((amount) => [amount, { ok: true, totalCost: q.cumulative[amount] }]));
     createPriceCache.set(key, curve);
@@ -3252,6 +5522,7 @@
     return curve;
   }
   function invalidatePreviews({ demand = false, ledgerState = false } = {}) {
+    if (demand || ledgerState) clearReviewedPlanCache();
     if (demand) {
       demandRevision++;
       clearDevelopmentSummaryCaches();
@@ -3259,6 +5530,9 @@
       demandHitIndexRevision = -1;
       demandHitIndexPoints = null;
       demandHitIndexGrid = null;
+      drivingDonorCacheRevision = -1;
+      drivingDonorCache = null;
+      specialRegionalPotentialCache.clear();
     }
     if (ledgerState) clearDevelopmentSummaryCaches();
     existingPriceCache.clear();
@@ -3276,7 +5550,7 @@
       invalidatePreviews({ demand: true });
       const current = uiStore.get();
       const stillSelected = String(current.selectedId || "") === String(pointId);
-      if (stillSelected) uiStore.set({ existingSide: side, selectedAmount: CFG.STEP });
+      if (stillSelected) uiStore.set({ existingSide: side === "work" ? (specialPointKind(pointId) || "work") : side, selectedAmount: CFG.STEP });
       refreshOverlay();
       if (focus && stillSelected && index === delays.length - 1) focusDemandPoint(pointId);
     }
@@ -3291,17 +5565,26 @@
     const dd = api.gameState.getDemandData();
     const p = dd?.points.get(id);
     if (!dd || !p) return;
+    const s = uiStore.get();
+    if (!isCurrentExistingReview(s)) {
+      uiStore.set({ busy: false, status: "Review the planned connections before building." });
+      refreshOverlay();
+      return;
+    }
     uiStore.set({ busy: true, status: "Preparing…" });
-    const plan = planDevelopment(dd, p, side, amount, false);
+    const reviewKey = existingReviewKey(id, side, amount);
+    const plan = reviewedPlanForKey(reviewKey) || planDevelopment(dd, p, side, amount, false);
+    clearReviewedPlanCache();
     if (!plan.ok) { uiStore.set({ busy: false, status: plan.error }); return; }
     uiStore.set({ status: `Adding +${amount} ${side === "residential" ? "Residents" : "Workers"}…` });
     const result = await executePlan(plan);
     if (result.ok) {
       invalidatePreviews({ demand: true });
       uiStore.set({
+        ...clearCreateReviewState(),
         selectedId: String(id),
         mode: "normal",
-        existingSide: side,
+        existingSide: side === "work" ? (specialPointKind(id) || "work") : side,
         createSide: null,
         selectedAmount: CFG.STEP,
         pendingLocation: null,
@@ -3322,7 +5605,7 @@
     }
   }
 
-  async function runCreate(side, amount = 200) {
+  async function runCreate(side, amount = 200, createKind = null) {
     if (buildLocked || uiStore.get().busy) return;
     buildLocked = true;
     try {
@@ -3330,33 +5613,35 @@
     const dd = api.gameState.getDemandData();
     if (!dd || !s.pendingLocation) return;
 
-    const placementError = placementBlockReason(s.pendingLocation);
+    const placementError = placementBlockReason(s.pendingLocation, createKind);
     if (placementError) {
-      uiStore.set({ busy: false, pendingLocation: null, selectedAmount: null, status: placementError });
+      uiStore.set({ busy: false, pendingLocation: null, pendingLandConversion: null, pendingAirportCluster: null, selectedAmount: null, status: placementError });
       refreshOverlay();
       return;
     }
 
-    let overlappingId = null;
-    let overlappingDistance = Infinity;
-    for (const rec of demandGeoCandidates(s.pendingLocation, 15, dd)) {
-      const { id, p } = rec;
-      if (!Array.isArray(p?.location)) continue;
-      const d = haversine(s.pendingLocation, p.location);
-      if (d < overlappingDistance) { overlappingDistance = d; overlappingId = String(id); }
-    }
-    if (overlappingId && overlappingDistance <= 15) {
+    const overlap = overlappingDemandPoint(s.pendingLocation, dd);
+    if (overlap) {
       uiStore.set({
+        ...clearCreateReviewState(),
         busy: false,
-        previewExistingId: overlappingId,
+        previewExistingId: overlap.id,
         status: "There's already a demand point here. Use Develop or choose another location.",
       });
       refreshOverlay();
       return;
     }
 
+    if (!isCurrentCreateReview(s)) {
+      uiStore.set({ busy: false, status: "Review the planned connections before building." });
+      refreshOverlay();
+      return;
+    }
+
     uiStore.set({ busy: true, status: "Preparing…" });
-    const plan = planDevelopment(dd, { location: s.pendingLocation }, side, amount, true);
+    const reviewKey = createReviewKey(s.pendingLocation, side, amount, createKind, s.pendingLandConversion, s.pendingAirportCluster);
+    const plan = reviewedPlanForKey(reviewKey) || planDevelopment(dd, { location: s.pendingLocation, landConversion: s.pendingLandConversion, airportCluster: s.pendingAirportCluster }, side, amount, true, createKind);
+    clearReviewedPlanCache();
     if (!plan.ok) { uiStore.set({ busy: false, status: plan.error }); return; }
     uiStore.set({ status: "Creating point…" });
     const result = await executePlan(plan);
@@ -3365,17 +5650,20 @@
       uiStore.set({
         status: "Recalculating…",
         mode: "normal",
-        existingSide: side,
+        existingSide: side === "work" ? (specialPointKind(plan.pointId) || "work") : side,
         createSide: null,
+        createKind: null,
+        ...clearCreateReviewState(),
         selectedId: String(plan.pointId),
         pendingLocation: null,
+        pendingLandConversion: null, pendingAirportCluster: null,
         selectedAmount: CFG.STEP,
       });
       refreshOverlay();
       await schedulePostBuildPriceRefresh(plan.pointId, side, { focus: true });
       uiStore.set({
         busy: false,
-        status: `Created point with ${amount} ${side === "residential" ? "Residents" : "Workers"} for ${fmtMoney(plan.totalCost)}.`,
+        status: `Created ${plan.createKind === "airport" ? "Airport workplace" : plan.createKind === "university" ? "University workplace" : "point"} with ${amount} ${side === "residential" ? "Residents" : "Workers"} for ${fmtMoney(plan.totalCost)}.`,
       });
     } else {
       uiStore.set({
@@ -3384,6 +5672,10 @@
         mode: s.mode,
         existingSide: s.existingSide,
         createSide: s.createSide,
+        createKind: s.createKind,
+        createReviewed: s.createReviewed,
+        reviewKey: s.reviewKey,
+        reviewConnections: s.reviewConnections,
         selectedId: null,
         pendingLocation: s.pendingLocation,
         selectedAmount: s.selectedAmount,
@@ -3407,7 +5699,6 @@
   function registerPanel() {
     if (panelRegistered) return true;
     if (!api?.ui?.addToolbarPanel || !api?.utils?.React) {
-      console.warn(`${TAG} UI API not ready yet; will retry`);
       return false;
     }
     const React = api.utils.React;
@@ -3459,14 +5750,15 @@
       }, []);
       React.useEffect(() => {
         uiStore.set({ panelOpen: true });
-        if (pointsNeedRefresh || !demandReady) {
-          setTimeout(() => reloadDemandPoints({ showStatus: false }), 0);
+        scheduleLocationIndexRefresh(locationIndexPending ? 0 : 80);
+        if (!demandReady) {
+          scheduleDemandReadyProbe(null, 0);
         } else {
           ensureOverlay();
           refreshOverlay();
         }
         return () => {
-          uiStore.set({ panelOpen: false, selectedId: null, pendingLocation: null, infoOpen: false });
+          uiStore.set({ panelOpen: false, selectedId: null, pendingLocation: null, pendingLandConversion: null, pendingAirportCluster: null, infoOpen: false });
           clearOverlay();
         };
       }, []);
@@ -3475,14 +5767,14 @@
       const selected = s.selectedId ? dd?.points.get(s.selectedId) : null;
       const previewExisting = s.previewExistingId ? dd?.points.get(s.previewExistingId) : null;
       const createSide = s.mode === "create" ? s.createSide : null;
-      const createCurve = createSide && s.pendingLocation ? priceCurveForCreate(s.pendingLocation) : null;
+      const createCurve = createSide && s.pendingLocation ? priceCurveForCreate(s.pendingLocation, s.createKind, s.pendingLandConversion, s.pendingAirportCluster) : null;
       const currentBudget = safeBudget();
       const row = (label, value) => h("div", { style: { display: "flex", justifyContent: "space-between", gap: 8, fontSize: 12 } }, h("span", { style: { opacity: .72 } }, label), h("span", null, value));
-      const upgradeChoices = (side, isCreate = false, curve = null) => {
+      const buildChoices = (side, isCreate = false, curve = null, displayLabel = null) => {
         const amount = DEVELOPMENT_AMOUNTS.includes(s.selectedAmount) ? s.selectedAmount : CFG.STEP;
         const q = isCreate ? curve?.[amount] : (selected ? previewForExisting(selected.id, side, amount) : null);
         const ok = !!q?.ok;
-        const sideLabel = side === "residential" ? "Residents" : "Workers";
+        const sideLabel = displayLabel || (side === "residential" ? "Residents" : "Workers");
         const presetLabel = (preset) => preset.toLocaleString();
         return h("div", { style: { marginTop: 8, width: "100%", minWidth: 0 } },
           h("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", minHeight: 58, border: "1px solid rgba(255,255,255,.16)", borderRadius: 7, overflow: "hidden", background: "rgba(255,255,255,.035)" } },
@@ -3503,7 +5795,12 @@
                 key: `${isCreate ? "create" : side}-preset-${preset}`,
                 type: "button",
                 disabled: s.busy || !pq?.ok,
-                onClick: () => { if (uiStore.get().busy || buildLocked) return; uiStore.set({ selectedAmount: preset, status: "" }); },
+                onClick: () => {
+                  if (uiStore.get().busy || buildLocked) return;
+                  clearReviewedPlanCache();
+                  uiStore.set({ ...clearCreateReviewState(), selectedAmount: preset, status: "" });
+                  refreshOverlay();
+                },
                 style: {
                   minWidth: 0, minHeight: 28, padding: "4px 3px", border: 0,
                   borderLeft: index ? "1px solid rgba(255,255,255,.12)" : "none",
@@ -3522,38 +5819,90 @@
         const cost = q?.ok ? Number(q.totalCost) || 0 : 0;
         const shortfall = amount && q?.ok ? Math.max(0, cost - currentBudget) : 0;
         const hasFunds = !shortfall;
-        const canBuild = !!amount && !!q?.ok && hasFunds && !s.busy;
+        const reviewed = isCreate ? isCurrentCreateReview(s) : isCurrentExistingReview(s);
+        const canReview = !!amount && !!q?.ok && !s.busy;
+        const canBuild = canReview && hasFunds;
+        const canAct = !reviewed ? canReview : canBuild;
         let expansionText = null;
         if (amount && q?.ok) {
           if (isCreate) {
-            expansionText = `New point with ${amount.toLocaleString()} ${side === "residential" ? "Residents" : "Workers"}`;
+            expansionText = `New ${s.createKind === "airport" ? "Airport" : s.createKind === "university" ? "University" : "point"} with ${amount.toLocaleString()} ${side === "residential" ? "Residents" : "Workers"}`;
           } else if (selected) {
             const base = Math.max(0, Number(side === "residential" ? selected.residents : selected.jobs) || 0);
             const pct = base > 0 ? Math.round((amount / base) * 100) : 0;
             expansionText = `Expands this point by ${pct}%`;
           }
         }
-        return h("div", { style: { marginTop: 10, paddingTop: 9, borderTop: "1px solid rgba(255,255,255,.12)", display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 } },
+        return h("div", { style: { marginTop: 10, paddingTop: 9, borderTop: "1px solid rgba(255,255,255,.12)", display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 10 } },
           h("div", { style: { minWidth: 0, fontSize: 11, lineHeight: 1.35 } },
             amount && q?.ok
               ? h("div", null,
                   expansionText ? h("div", { style: { opacity: .72, marginBottom: 2 } }, expansionText) : null,
+                  (() => {
+                    const parts = isCreate
+                      ? newPointPriceParts(s.createKind, !!s.pendingLandConversion, s.pendingAirportCluster)
+                      : (selected ? existingPriceParts(selected.id, side) : []);
+                    if (!parts.length) return null;
+                    return h("div", { style: { margin: "5px 0 4px", paddingTop: 5, borderTop: "1px solid rgba(255,255,255,.08)", fontSize: 10, lineHeight: 1.35 } },
+                      h("div", { style: { marginBottom: 3, opacity: .46, fontSize: 9, fontWeight: 700, textTransform: "uppercase", letterSpacing: ".045em" } }, isCreate ? "First +200 adjustments" : "Price adjustments"),
+                      ...parts.map((part) => h("div", {
+                        key: part.label,
+                        style: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, opacity: .66, padding: "1px 0" }
+                      },
+                        h("span", null, part.label),
+                        h("span", { style: { flex: "0 0 auto", fontVariantNumeric: "tabular-nums" } }, `+${Math.round(part.surcharge * 100)}%`)
+                      ))
+                    );
+                  })(),
                   shortfall
                     ? h("div", { style: { color: "#f87171", fontWeight: 700 } }, `Need ${fmtMoney(shortfall)} more`)
                     : h("div", { style: { opacity: .88, fontWeight: 600 } }, `Balance after: ${fmtBalance(currentBudget - cost)}`)
                 )
               : h("span", { style: { opacity: .55 } }, "Choose a size")
           ),
-          h(Button, {
-            disabled: !canBuild,
-            onClick: () => { if (!canBuild) return; isCreate ? runCreate(side, amount) : runExisting(selected.id, side, amount); },
-            style: { flex: "0 0 auto", minWidth: 88, minHeight: 36, padding: "7px 14px", fontWeight: 700, background: canBuild ? "rgba(34,197,94,.20)" : "rgba(255,255,255,.06)", borderColor: canBuild ? "rgba(74,222,128,.45)" : "rgba(255,255,255,.18)" }
-          }, s.busy ? "Building…" : "Build")
+          h("div", { style: { flex: "0 0 auto", display: "flex", alignItems: "center", gap: 5 } },
+            reviewed ? h("button", {
+              type: "button",
+              disabled: s.busy,
+              title: "Cancel review",
+              "aria-label": "Cancel review",
+              onClick: () => {
+                if (uiStore.get().busy) return;
+                clearReviewedPlanCache();
+                uiStore.set({ ...clearCreateReviewState(), status: "" });
+                refreshOverlay();
+              },
+              style: {
+                width: 32, height: 36, padding: 0, borderRadius: 6, border: "1px solid rgba(248,113,113,.28)",
+                background: "transparent", color: "#fca5a5", cursor: s.busy ? "not-allowed" : "pointer",
+                display: "inline-flex", alignItems: "center", justifyContent: "center", fontFamily: "inherit", fontSize: 18, lineHeight: 1, opacity: s.busy ? .45 : 1
+              }
+            }, "×") : null,
+            h(Button, {
+              disabled: !canAct,
+              onClick: () => {
+                if (!canAct) return;
+                if (!reviewed) {
+                  if (isCreate) prepareCreateReview(side, amount, s.createKind);
+                  else prepareExistingReview(selected.id, side, amount);
+                  return;
+                }
+                isCreate ? runCreate(side, amount, s.createKind) : runExisting(selected.id, side, amount);
+              },
+              style: {
+                flex: "0 0 auto", minWidth: 88, minHeight: 36, padding: "7px 14px", fontWeight: 700,
+                background: canAct ? (!reviewed ? "rgba(59,130,246,.18)" : "rgba(34,197,94,.20)") : "rgba(255,255,255,.06)",
+                borderColor: canAct ? (!reviewed ? "rgba(96,165,250,.45)" : "rgba(74,222,128,.45)") : "rgba(255,255,255,.18)"
+              }
+            }, s.busy ? "Building…" : (!reviewed ? "Review" : "Build"))
+          )
         );
       };
-      const sideButtons = (current, onPick) => h("div", { style: { display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: 8, marginBottom: 10, width: "100%", minWidth: 0 } },
+      const existingTypeButtons = (current, onPick) => h("div", { style: { display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: 8, marginBottom: 10, width: "100%", minWidth: 0 } },
         h(Button, { active: current === "residential", disabled: s.busy, onClick: () => { if (uiStore.get().busy || buildLocked) return; onPick("residential"); }, style: { width: "100%" } }, "Residents"),
-        h(Button, { active: current === "work", disabled: s.busy, onClick: () => { if (uiStore.get().busy || buildLocked) return; onPick("work"); }, style: { width: "100%" } }, "Workers")
+        h(Button, { active: current === "work", disabled: s.busy, onClick: () => { if (uiStore.get().busy || buildLocked) return; onPick("work"); }, style: { width: "100%" } }, "Workers"),
+        h(Button, { active: current === "university", disabled: s.busy, onClick: () => { if (uiStore.get().busy || buildLocked) return; onPick("university"); }, style: { width: "100%" } }, "University"),
+        h(Button, { active: current === "airport", disabled: s.busy, onClick: () => { if (uiStore.get().busy || buildLocked) return; onPick("airport"); }, style: { width: "100%" } }, "Airport")
       );
       const locationHeader = (location, pointId = null, planned = false) => {
         const parts = locationHeaderParts(location);
@@ -3617,7 +5966,7 @@
         const dd = api.gameState.getDemandData?.();
         const growthPercent = mapGrowthPercent(activeAddedDemand(), originalMapDemand(dd));
         const { totalSpent, improvements, activePeople } = developmentInfoStats();
-        const stat = (label, value) => h("div", { style: { padding: "8px 9px", border: "1px solid rgba(255,255,255,.12)", borderRadius: 7, minWidth: 0 } },
+        const stat = (label, value, title = null) => h("div", { title: title || undefined, style: { padding: "8px 9px", border: "1px solid rgba(255,255,255,.12)", borderRadius: 7, minWidth: 0 } },
           h("div", { style: { fontSize: 10, opacity: .58, textTransform: "uppercase", letterSpacing: ".05em" } }, label),
           h("div", { style: { marginTop: 2, fontSize: 15, fontWeight: 700 } }, value));
         return h("div", null,
@@ -3625,7 +5974,7 @@
             stat("Total spent", fmtMoney(totalSpent)),
             stat("Improvements", Math.round(improvements).toLocaleString()),
             stat("Demand added", Math.round(activePeople).toLocaleString()),
-            stat("Map growth", `${growthPercent.toFixed(1)}%`)
+            stat("Map growth", `${growthPercent.toFixed(1)}%`, "Active demand added by Demand Developer compared with the original map. Each +0.1% raises future development prices by 1%.")
           ),
           groups.length ? h("div", null,
             h("div", { style: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, marginBottom: 7 } },
@@ -3637,7 +5986,14 @@
                 if (nextVisible) focusDevelopmentGroups(groups);
               }, style: { padding: "4px 7px", borderRadius: 5, border: "1px solid rgba(255,255,255,.18)", background: s.infoMapVisible ? "rgba(255,255,255,.12)" : "rgba(255,255,255,.06)", color: "inherit", cursor: "pointer", fontSize: 10, fontWeight: 700 } }, s.infoMapVisible ? "Hide from map" : "Show all on map")
             ),
-            h("div", { style: { display: "flex", flexDirection: "column", gap: 5, maxHeight: 280, overflowY: "auto", overscrollBehavior: "contain", paddingRight: 3 } }, ...groups.map((g) => h("div", {
+            h("div", { style: { display: "flex", flexDirection: "column", gap: 5, maxHeight: 280, overflowY: "auto", overscrollBehavior: "contain", paddingRight: 3 } }, ...groups.map((g) => {
+              const point = dd?.points?.get(g.pointId) || null;
+              const visualType = developedSideForPoint(g.pointId, point);
+              const accentColor = visualType === "residential" ? "#60a5fa"
+                : visualType === "university" ? "#4ade80"
+                : visualType === "airport" ? "#c084fc"
+                : "#f59e0b";
+              return h("div", {
               key: g.pointId,
               onClick: () => {
                 if (s.busy) return;
@@ -3649,6 +6005,7 @@
               style: {
                 padding: "7px 8px",
                 border: String(s.selectedId || "") === String(g.pointId) ? "1px solid rgba(255,255,255,.40)" : "1px solid rgba(255,255,255,.13)",
+                borderLeft: `3px solid ${accentColor}`,
                 borderRadius: 7,
                 minWidth: 0,
                 background: String(s.selectedId || "") === String(g.pointId) ? "rgba(255,255,255,.07)" : "transparent",
@@ -3716,10 +6073,11 @@
                   h("div", { style: { marginTop: 1, fontSize: 11, fontWeight: 750 } }, fmtMoney(g.spent || 0))
                 )
               )
-            )))
+            );
+            }))
           ) : h("div", { style: { fontSize: 12, opacity: .65, padding: "8px 0" } }, "No development yet."),
           (() => {
-            const hasActiveDevelopment = activeOwnedPopCount() > 0;
+            const hasActiveDevelopment = hasAnyActiveDevelopment();
             return h("button", { type: "button", disabled: s.busy || !hasActiveDevelopment, onClick: () => {
               if (typeof window !== "undefined" && !window.confirm("Remove all development? Money spent will not be refunded.")) return;
               const r = removeAllDevelopment();
@@ -3732,34 +6090,33 @@
         type: "button",
         title: "Development history",
         "aria-label": "Development history",
-        onClick: () => { uiStore.set({ infoOpen: true, infoMapVisible: false, selectedId: null, selectedAmount: null, pendingLocation: null, status: "" }); refreshOverlay(); },
+        onClick: () => { uiStore.set({ infoOpen: true, infoMapVisible: false, selectedId: null, selectedAmount: null, pendingLocation: null, pendingLandConversion: null, pendingAirportCluster: null, status: "" }); refreshOverlay(); },
         style: { width: 28, height: 28, padding: 0, borderRadius: 999, border: "1px solid rgba(255,255,255,.20)", background: "rgba(255,255,255,.06)", color: "inherit", display: "inline-flex", alignItems: "center", justifyContent: "center", cursor: "pointer", flex: "0 0 auto" }
       }, api.utils.icons?.Info ? h(api.utils.icons.Info, { size: 16, strokeWidth: 2 }) : h("span", { style: { fontWeight: 700, fontSize: 15 } }, "i"));
-      const reloadPointsButton = () => h("button", {
-        type: "button",
-        title: "Refresh demand points",
-        "aria-label": "Refresh demand points",
-        disabled: s.busy,
-        onClick: () => reloadDemandPoints({ showStatus: true }),
-        style: { width: 28, height: 28, padding: 0, borderRadius: 6, border: "1px solid rgba(255,255,255,.20)", background: "rgba(255,255,255,.06)", color: "inherit", display: "inline-flex", alignItems: "center", justifyContent: "center", cursor: s.busy ? "not-allowed" : "pointer", opacity: s.busy ? .45 : 1, flex: "0 0 auto", fontSize: 17, lineHeight: 1 }
-      }, "↻");
       const pointTypeHeader = () => h("div", { style: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, marginBottom: 4 } },
-        h("div", { style: { display: "flex", alignItems: "center", gap: 6, minWidth: 0 } },
-          h("div", { style: { fontSize: 12, fontWeight: 700 } }, "Demand type"),
-          reloadPointsButton()
-        ),
+        h("div", { style: { fontSize: 12, fontWeight: 700 } }, "Demand type"),
         infoButton()
       );
       const existingMiniPreview = () => {
         if (!previewExisting || !s.previewExistingId || s.mode !== "create") return null;
-        const side = dominantLiveSide(previewExisting);
-        const sideColor = side === "residential" ? "#60a5fa" : "#f59e0b";
-        return h("div", { style: { marginBottom: 8, padding: "6px 8px", border: "1px solid rgba(255,255,255,.14)", borderLeft: `3px solid ${sideColor}`, borderRadius: 6, background: "rgba(255,255,255,.025)" } },
-          locationHeader(previewExisting.location, null, false),
-          h("div", { style: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 } },
-            h("div", { style: { minWidth: 0, fontSize: 9, lineHeight: 1.3, opacity: .72 } },
-              `${Math.round(previewExisting.residents || 0).toLocaleString()} Residents · ${Math.round(previewExisting.jobs || 0).toLocaleString()} Workers`
-            ),
+        const residents = Math.round(previewExisting.residents || 0);
+        const workers = Math.round(previewExisting.jobs || 0);
+        const special = specialPointKind(s.previewExistingId);
+        const visualType = existingPointType(previewExisting);
+        const sideColor = visualType === "residential" ? "#60a5fa"
+          : visualType === "university" ? "#4ade80"
+          : visualType === "airport" ? "#c084fc"
+          : "#f59e0b";
+        const typeLabel = special === "airport" ? "Airport" : special === "university" ? "University" : null;
+        return h("div", { style: { marginBottom: 8, padding: "7px 8px", border: "1px solid rgba(255,255,255,.14)", borderLeft: `3px solid ${sideColor}`, borderRadius: 6, background: "rgba(255,255,255,.025)" } },
+          h("div", { style: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, marginBottom: 2 } },
+            h("div", { style: { minWidth: 0 } }, locationHeader(previewExisting.location, null, false)),
+            typeLabel ? h("div", { style: { flex: "0 0 auto", fontSize: 9, fontWeight: 800, opacity: .82 } }, typeLabel) : null
+          ),
+          h("div", { style: { fontSize: 9, lineHeight: 1.35, opacity: .72, marginBottom: 5 } },
+            `${residents.toLocaleString()} Residents · ${workers.toLocaleString()} Workers`
+          ),
+          h("div", { style: { display: "flex", justifyContent: "flex-end" } },
             h("button", {
               type: "button",
               disabled: s.busy,
@@ -3767,11 +6124,11 @@
                 const id = String(s.previewExistingId);
                 const p = api.gameState.getDemandData?.()?.points?.get(id);
                 if (!p) return;
-                uiStore.set({ mode: "normal", createSide: null, pendingLocation: null, previewExistingId: null, existingSide: dominantLiveSide(p), selectedId: id, selectedAmount: CFG.STEP, status: "" });
+                uiStore.set({ ...clearCreateReviewState(), mode: "normal", createSide: null, createKind: null, pendingLocation: null, pendingLandConversion: null, pendingAirportCluster: null, previewExistingId: null, existingSide: existingPointType(p), showExistingConnections: false, selectedId: id, selectedAmount: CFG.STEP, status: "" });
                 refreshOverlay();
                 focusDemandPoint(id);
               },
-              style: { flex: "0 0 auto", padding: "3px 6px", borderRadius: 5, border: "1px solid rgba(255,255,255,.18)", background: "rgba(255,255,255,.06)", color: "inherit", cursor: s.busy ? "not-allowed" : "pointer", fontFamily: "inherit", fontSize: 9, fontWeight: 700 }
+              style: { padding: "3px 6px", borderRadius: 5, border: "1px solid rgba(255,255,255,.18)", background: "rgba(255,255,255,.06)", color: "inherit", cursor: s.busy ? "not-allowed" : "pointer", fontFamily: "inherit", fontSize: 9, fontWeight: 700 }
             }, "Develop")
           )
         );
@@ -3782,56 +6139,103 @@
           ? h("div", { style: { display: "grid", gridTemplateColumns: "1fr", marginBottom: 10 } },
               h(Button, { style: { width: "100%", minHeight: 38 }, onClick: () => { uiStore.set({ infoOpen: false, infoMapVisible: false, selectedId: null, status: "" }); refreshOverlay(); } }, "Back"))
           : h("div", { style: { display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: 6, marginBottom: 10, minWidth: 0 } },
-              h(Button, { active: s.mode !== "create", style: { width: "100%", minHeight: 38 }, onClick: () => { uiStore.set({ mode: "normal", createSide: null, pendingLocation: null, selectedId: null, selectedAmount: null, status: "" }); refreshOverlay(); } }, "Existing point"),
-              h(Button, { active: s.mode === "create", style: { width: "100%", minHeight: 38 }, onClick: () => { uiStore.set({ mode: "create", existingSide: null, createSide: null, selectedId: null, previewExistingId: null, selectedAmount: null, pendingLocation: null, status: "" }); refreshOverlay(); } }, "New point")),
+              h(Button, { active: s.mode !== "create", style: { width: "100%", minHeight: 38 }, onClick: () => { uiStore.set({ mode: "normal", createSide: null, createKind: null, ...clearCreateReviewState(), pendingLocation: null, showExistingConnections: false, selectedId: null, selectedAmount: null, status: "" }); refreshOverlay(); } }, "Existing point"),
+              h(Button, { active: s.mode === "create", style: { width: "100%", minHeight: 38 }, onClick: () => { uiStore.set({ mode: "create", existingSide: null, createSide: null, createKind: null, createReviewed: false, reviewKey: null, reviewConnections: [], showExistingConnections: false, selectedId: null, previewExistingId: null, selectedAmount: null, pendingLocation: null, pendingLandConversion: null, pendingAirportCluster: null, status: "" }); refreshOverlay(); } }, "New point")),
         s.infoOpen ? infoView() : null,
 
         !s.infoOpen && s.mode !== "create" ? h("div", null,
           pointTypeHeader(),
-          sideButtons(s.existingSide, (side) => {
+          existingTypeButtons(s.existingSide, (type) => {
             clearOverlay();
             const liveSelected = s.selectedId ? dd?.points?.get(s.selectedId) : null;
-            const hasSide = liveSelected ? sideMass(liveSelected, side) > 0 : false;
+            const keepSelected = liveSelected && pointMatchesExistingType(liveSelected, type);
             uiStore.set({
-              existingSide: side,
-              selectedId: liveSelected && hasSide ? s.selectedId : null,
-              selectedAmount: liveSelected && hasSide ? CFG.STEP : null,
-              status: liveSelected && !hasSide
-                ? `This point has no ${side === "residential" ? "Residents" : "Workers"}.`
-                : "",
+              ...clearCreateReviewState(),
+              existingSide: type,
+              showExistingConnections: false,
+              selectedId: keepSelected ? s.selectedId : null,
+              selectedAmount: keepSelected ? CFG.STEP : null,
+              status: "",
             });
             refreshOverlay();
           }),
-          !s.existingSide ? h("div", { style: { fontSize: 12, lineHeight: 1.45, opacity: .76, marginBottom: 8 } }, "Select a demand point on the map.") :
-          !selected ? h("div", { style: { fontSize: 12, lineHeight: 1.45, opacity: .76, marginBottom: 8 } }, `Select a highlighted ${s.existingSide === "residential" ? "Residents" : "Workers"} point.`) : null,
+          !s.existingSide ? h("div", { style: { fontSize: 12, lineHeight: 1.45, opacity: .76, marginBottom: 8 } }, "Choose a point type, then select a demand point on the map.") :
+          !selected ? h("div", { style: { fontSize: 12, lineHeight: 1.45, opacity: .76, marginBottom: 8 } }, `Select a highlighted ${existingTypeLabel(s.existingSide)} point.`) : null,
           selected ? h("div", null,
             locationHeader(selected.location, selected.id, false),
             row("Residents", Math.round(selected.residents || 0).toLocaleString()),
             row("Workers", Math.round(selected.jobs || 0).toLocaleString()),
             nearbyStationsBlock(selected.location),
-            h("div", { style: { marginTop: 10, fontSize: 12, fontWeight: 700 } }, s.existingSide === "residential" ? "Residents upgrade" : "Workers upgrade"),
-            upgradeChoices(s.existingSide, false, null),
-            buildBar(s.existingSide, false, null)
+            h("div", { style: { marginTop: 10, display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 } },
+              h("div", { style: { fontSize: 12, fontWeight: 700 } }, `${existingTypeLabel(s.existingSide)} Build`),
+              (() => {
+                const existingConnections = existingConnectionsForPoint(dd, s.selectedId);
+                const count = existingConnections.length;
+                const showing = !!s.showExistingConnections;
+                return h("button", {
+                  type: "button",
+                  disabled: s.busy || count === 0,
+                  title: count ? `${showing ? "Hide" : "Show"} all ${count.toLocaleString()} existing connections` : "No existing connections",
+                  onClick: () => {
+                    if (uiStore.get().busy || count === 0) return;
+                    clearReviewedPlanCache();
+                    uiStore.set({
+                      ...clearCreateReviewState(),
+                      showExistingConnections: !uiStore.get().showExistingConnections,
+                      status: !showing
+                        ? `Showing all ${count.toLocaleString()} existing connection${count === 1 ? "" : "s"} for this point.`
+                        : "",
+                    });
+                    refreshOverlay();
+                  },
+                  style: {
+                    flex: "0 0 auto", padding: "4px 7px", borderRadius: 6,
+                    border: showing ? "1px solid rgba(96,165,250,.55)" : "1px solid rgba(255,255,255,.18)",
+                    background: showing ? "rgba(59,130,246,.16)" : "rgba(255,255,255,.05)",
+                    color: "inherit", cursor: s.busy || count === 0 ? "default" : "pointer",
+                    opacity: s.busy || count === 0 ? .4 : 1, fontFamily: "inherit", fontSize: 9, fontWeight: 700,
+                    whiteSpace: "nowrap",
+                  },
+                }, `${showing ? "Hide" : "Show"} existing (${count.toLocaleString()})`);
+              })()
+            ),
+            buildChoices(existingTypeSide(s.existingSide), false, null, existingTypeLabel(s.existingSide)),
+            buildBar(existingTypeSide(s.existingSide), false, null)
           ) : null
         ) : null,
 
         !s.infoOpen && s.mode === "create" ? h("div", { style: { marginTop: 2 } },
           existingMiniPreview(),
           pointTypeHeader(),
-          sideButtons(createSide, (side) => {
-            clearOverlay();
-            uiStore.set({ createSide: side, selectedAmount: CFG.STEP, status: "" });
-            refreshOverlay();
-          }),
-          h("div", { style: { fontSize: 12, lineHeight: 1.45, opacity: .76, marginBottom: 8 } }, s.previewExistingId
-            ? (s.pendingLocation
-                ? "Existing point selected. Planned location unchanged."
-                : (createSide
-                    ? "Existing point selected. Click empty land to place the new point."
-                    : "Existing point selected."))
-            : (createSide
-                ? "Click the map to place the new point."
-                : "Choose Residents or Workers, then click the map.")),
+          h("div", { style: { display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: 8, marginBottom: 10, width: "100%", minWidth: 0 } },
+            h(Button, { active: createSide === "residential" && !s.createKind, disabled: s.busy, onClick: () => {
+              if (uiStore.get().busy || buildLocked) return;
+              clearOverlay();
+              uiStore.set({ ...clearCreateReviewState(), createSide: "residential", createKind: null, pendingAirportCluster: null, selectedAmount: CFG.STEP, status: "" });
+              refreshOverlay();
+            }, style: { width: "100%" } }, "Residents"),
+            h(Button, { active: createSide === "work" && !s.createKind, disabled: s.busy, onClick: () => {
+              if (uiStore.get().busy || buildLocked) return;
+              clearOverlay();
+              uiStore.set({ ...clearCreateReviewState(), createSide: "work", createKind: null, pendingAirportCluster: null, selectedAmount: CFG.STEP, status: "" });
+              refreshOverlay();
+            }, style: { width: "100%" } }, "Workers"),
+            h(Button, { active: s.createKind === "university", disabled: s.busy, onClick: () => {
+              if (uiStore.get().busy || buildLocked) return;
+              clearOverlay();
+              uiStore.set({ ...clearCreateReviewState(), createSide: "work", createKind: "university", pendingAirportCluster: null, selectedAmount: CFG.STEP, status: "" });
+              refreshOverlay();
+            }, style: { width: "100%" } }, "University"),
+            h(Button, { active: s.createKind === "airport", disabled: s.busy, onClick: () => {
+              if (uiStore.get().busy || buildLocked) return;
+              clearOverlay();
+              uiStore.set({ ...clearCreateReviewState(), createSide: "work", createKind: "airport", pendingAirportCluster: Array.isArray(uiStore.get().pendingLocation) ? airportClusterStatus(uiStore.get().pendingLocation).cluster : null, selectedAmount: CFG.STEP, status: "" });
+              refreshOverlay();
+            }, style: { width: "100%" } }, "Airport")
+          ),
+          !s.pendingLocation ? h("div", { style: { fontSize: 12, lineHeight: 1.45, opacity: .76, marginBottom: 8 } }, createSide
+            ? "Click the map to place the new point."
+            : "Choose a demand type, then click the map.") : null,
           s.pendingLocation ? h("div", null,
             h("div", { style: { marginBottom: 6, padding: "6px 8px", border: "1px solid rgba(255,255,255,.16)", borderRadius: 6 } },
               h("div", { style: { fontSize: 10, opacity: .55, textTransform: "uppercase", letterSpacing: ".06em" } }, "Planned point"),
@@ -3839,7 +6243,7 @@
             ),
             nearbyStationsBlock(s.pendingLocation),
             createSide ? h("div", null,
-              upgradeChoices(createSide, true, createCurve),
+              buildChoices(createSide, true, createCurve),
               buildBar(createSide, true, createCurve)
             ) : null
           ) : null
@@ -3864,51 +6268,14 @@
     }
   }
 
-  function reloadDemandPoints({ showStatus = true } = {}) {
-    invalidatePreviews({ demand: true });
-    const map = api.utils.getMap?.();
-    try {
-      if (map) {
-        installMapClick(map);
-        bindLocationIndex(map);
-      }
-      const dd = api.gameState.getDemandData?.();
-      if (dd?.points) {
-        if (!demandReady) {
-          void initDemandReady();
-        } else {
-          pointsNeedRefresh = false;
-          ensureOverlay();
-          installMapClick(map);
-          refreshUi();
-        }
-        if (showStatus) uiStore.set({ status: "Demand points refreshed." });
-        return true;
-      }
-      pointsNeedRefresh = true;
-      if (showStatus) uiStore.set({ status: "Waiting for demand…" });
-      scheduleDemandReadyProbe(map || null);
-      return false;
-    } catch (e) {
-      console.warn(`${TAG} demand reload failed`, e);
-      pointsNeedRefresh = true;
-      if (showStatus) uiStore.set({ status: "Refresh failed; retrying…" });
-      scheduleDemandReadyProbe(map || null);
-      return false;
-    }
-  }
-
   function cleanupEmptyOwnedPoints() {
     if (uiStore.get().busy) return;
-    const dd = api.gameState.getDemandData?.();
-    if (!dd?.points || !api.demand?.removeDemandPoint) return;
-    for (const [id, p] of dd.points.entries()) {
-      if (!String(id).startsWith(CFG.NEW_POINT_PREFIX)) continue;
-      if ((p?.residents || 0) !== 0 || (p?.jobs || 0) !== 0 || (p?.popIds?.length || 0) !== 0) continue;
-      try {
-        const r = api.demand.removeDemandPoint(id);
-        if (!r?.success) console.warn(`${TAG} could not clean empty owned point ${id}: ${r?.error || "unknown error"}`);
-      } catch (e) { console.warn(`${TAG} cleanup failed for ${id}`, e); }
+    beginInternalDemandMutation();
+    try {
+      const result = cleanupEmptyCreatedPoints(api.gameState.getDemandData?.());
+      for (const error of result.errors || []) console.warn(`${TAG} empty-point cleanup failed: ${error}`);
+    } finally {
+      endInternalDemandMutation();
     }
   }
 
@@ -3932,7 +6299,6 @@
       const dd = api.gameState.getDemandData?.();
       if (dd?.points && dd?.popsMap && ledgerNeedsLiveRestore(dd)) {
         demandReady = false;
-        pointsNeedRefresh = true;
         scheduleDemandReadyProbe(null, 300);
         return;
       }
@@ -3975,14 +6341,12 @@
   async function initDemandReady() {
     const epoch = lifecycleEpoch;
     const token = ++ledgerLoadToken;
-    pointsNeedRefresh = false;
     lifecycleCity = currentCity();
     const loadResult = await loadLedger(epoch, token);
     if (epoch !== lifecycleEpoch || token !== ledgerLoadToken) return false;
 
     const dd = api.gameState.getDemandData?.();
     if (!dd?.points || !dd?.popsMap) {
-      pointsNeedRefresh = true;
       return false;
     }
     if (loadResult?.needsLegacyRepair) {
@@ -3992,7 +6356,6 @@
 
     const replay = await replayActiveLedgerDemand(dd);
     if (!replay.ok) {
-      pointsNeedRefresh = true;
       demandReady = false;
       uiStore.set({ status: replay.error });
       console.warn(`${TAG} saved development replay failed: ${replay.error}`);
@@ -4001,8 +6364,11 @@
       refreshUi();
       return false;
     }
-    restoreOwnedPointModeShares(api.gameState.getDemandData?.() || dd);
+    const liveAfterReplay = api.gameState.getDemandData?.() || dd;
+    restoreOwnedPopRuntimeSnapshots(liveAfterReplay);
+    restoreOwnedPointModeShares(liveAfterReplay);
     cleanupEmptyOwnedPoints();
+    rememberPlanningDemandSignature(api.gameState.getDemandData?.() || dd);
     demandReady = true;
     ensureOverlay();
     installMapClick();
@@ -4015,7 +6381,6 @@
     installMapClick(map);
     bindLocationIndex(map);
     demandReady = false;
-    pointsNeedRefresh = true;
     scheduleDemandReadyProbe(map || null, 300);
   }
 
@@ -4031,7 +6396,6 @@
     const nextName = typeof saveName === "string" && saveName.length > 0 ? saveName : readLiveSaveName();
     currentSaveName = nextName;
     resetUiForMapTransition("Loading demand…");
-    pointsNeedRefresh = true;
     scheduleDemandReadyProbe(null, 350);
   }
 
@@ -4048,9 +6412,7 @@
 
   function handleDemandChange() {
     try {
-      if (replayingLedgerDemand) return;
-      invalidatePreviews({ demand: true });
-      pointsNeedRefresh = true;
+      if (replayingLedgerDemand || internalDemandMutationDepth > 0) return;
       const dd = api.gameState.getDemandData?.();
       if (dd?.points && dd?.popsMap) {
         if (loadedLedgerKey && ledgerNeedsLiveRestore(dd)) {
@@ -4058,9 +6420,21 @@
           scheduleDemandReadyProbe(null, 300);
           return;
         }
+
+        const nextSignature = planningDemandSignature(dd);
+        const structuralChange = lastPlanningDemandSignature != null
+          && nextSignature != null
+          && nextSignature !== lastPlanningDemandSignature;
+        lastPlanningDemandSignature = nextSignature;
+
+        // Runtime commute updates do not invalidate an unchanged Review plan.
+        if (structuralChange) {
+          invalidatePreviews({ demand: true });
+          if (uiStore.get().createReviewed) uiStore.set(clearCreateReviewState());
+        }
+
         if (demandReady) {
-          pointsNeedRefresh = false;
-          if (uiStore.get().panelOpen) { ensureOverlay(); refreshUi(); }
+          if (uiStore.get().panelOpen && structuralChange) { ensureOverlay(); refreshUi(); }
           return;
         }
         scheduleDemandReadyProbe(null, 300);
@@ -4114,6 +6488,7 @@
   }
 
   cleanupLegacyDomFallback();
+  installOwnedPopPathProvider();
 
   try { setTimeout(() => { ensureUi(); }, 0); } catch {}
   try {
@@ -4148,6 +6523,5 @@
     ensureUi();
     const map = api.utils.getMap?.();
     if (map) handleMapReady(map);
-    if (api.gameState.getDemandData?.()) pointsNeedRefresh = true;
   } catch {}
 })();
