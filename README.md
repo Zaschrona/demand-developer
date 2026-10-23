@@ -2,41 +2,36 @@
 
 **Author:** Zaschrona
 
-Demand Developer lets you create new demand points or expand existing ones directly from the map. Adding Residents creates matching workplace demand elsewhere; adding Workers creates matching residential demand, keeping new development connected through commuter flows.
-
-Version 1.1 adds University and Airport demand, connection previews, and more natural commuter planning for larger developments.
+Demand Developer lets you create, expand and demolish demand points directly on the Subway Builder map. It supports Residents, Workers, University and Airport demand and updates the commuter connections between them.
 
 ## Features
 
-- Expand existing points by +200, +400, +600, +800 or +1000 Residents or Workers, or create new points.
-- Create and expand University and Airport workplace demand.
-- Review planned commuter connections before Build.
-- Show all existing commuter connections for a selected point, including connections the base game does not display.
-- Follow the map's existing commute patterns when deciding how many connections to create and how large they should be.
-- Spread larger developments across suitable connections instead of concentrating them into a few oversized flows.
-- Track spending, active demand and map growth, and remove development created by the mod.
+- Create new demand points or expand existing ones by +200, +400, +600, +800 or +1000.
+- Reduce existing demand in **Demolish** mode, or use **All** to remove the remaining demand of the selected type.
+- Review planned changes and show the existing commuter connections of a selected point.
+- Spread new demand across suitable connections, adding separate commuter groups when needed.
+- Calculate road-following commuter routes in the background where map data allows it.
+- Track spending and map growth, and undo changes in **Development overview**.
 
 ## Installation
 
-Install **Demand Developer** through Railyard, or extract the release ZIP into the Subway Builder `mods` directory. Enable it in **Settings > Mods** and restart the game.
+Install **Demand Developer** through Railyard, or extract the ZIP into the Subway Builder `mods` directory. Enable it in **Settings > Mods** and restart the game.
 
 The **Demand Developer** button appears in the top-right toolbar after a city is loaded.
 
 ## Use
 
-Choose **Existing point** to expand a point already on the map, or **New point** to create one. Select Residents, Workers, University or Airport, choose an amount, then use **Review** before **Build**.
+Choose **New point** to create a demand point, or **Existing point** to change one already on the map. Select Residents, Workers, University or Airport, choose an amount and use **Review** before confirming.
 
-**Show existing** displays the current commuter connections of the selected point. Review and existing connections are drawn according to the size of each commuter flow.
+For existing points, switch to **Demolish** to reduce demand. **All** removes the exact amount remaining for the selected type. Use **Development overview** to inspect or undo changes. Development costs are not refunded.
 
-Most new points must be placed on valid land near existing demand. University and Airport demand use their own connection rules so they can draw from a wider area when appropriate.
+Review and **Show connections** display straight preview lines. Actual road routes are calculated separately and may take a few seconds to appear. On maps with incomplete or disconnected road data, some routes may remain straight. You can place a new demand point beyond the mapped roads; automatic commuter planning prefers points near roads where possible.
+
+Older Autosaves without a matching development checkpoint may restore more recent changes from the same play session.
 
 ## Development costs
 
-Development is paid from the city budget. Base prices depend on local demand density, so denser areas generally cost more.
-
-Only the first +200 of a new point receives creation surcharges. University and Airport demand have higher rates than normal residential or workplace development.
-
-**Map growth** is the active demand added by Demand Developer compared with the map's original demand. Every additional 0.1% of map growth increases future development prices by 1%.
+Build prices depend on local demand, demand type and map growth. Demolition costs 25% of the standard Residents build rate for all demand types. Prices are rounded to $1 million increments, and the overall price multiplier cannot fall below 1.00.
 
 ## License
 
