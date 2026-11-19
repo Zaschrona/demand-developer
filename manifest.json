@@ -2,7 +2,7 @@
   "id": "demand-developer",
   "name": "Demand Developer",
   "description": "Create, expand and reduce demand points directly on the map, with commuter demand updated automatically.",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "author": {
     "name": "Zaschrona"
   },

@@ -523,12 +523,27 @@
       checkpointIndexCache = rows;
     return checkpointIndexCache || rows;
   }
-  function selectCheckpointAtGameTime(rows, elapsed) {
+  function selectCheckpointAtGameTime(rows, elapsed, saveName = null, city = null) {
     if (elapsed == null) return { kind: 'time-unavailable', row: null };
-    const near = rows.map((r) => ({ row: r, distance: Math.abs(Number(r.elapsed) - elapsed) }))
+    const near = rows.filter((r) => !r.city || !city || r.city === city)
+      .map((r) => ({ row: r, distance: Math.abs(Number(r.elapsed) - elapsed) }))
       .filter((r) => r.distance <= CHECKPOINT_MATCH_TOLERANCE_SECONDS)
       .sort((a, b) => a.distance - b.distance || b.row.savedAt - a.row.savedAt);
     if (!near.length) return { kind: 'not-found', row: null };
+    const named = saveName ? near.filter(({ row }) => row.saveName === saveName) : [];
+    if (named.length) {
+      const atSameTime = named.every(({ row }) => Math.abs(Number(row.elapsed) - Number(named[0].row.elapsed)) < 0.01);
+      const sameState = named.every(({ row }) => row.signature === named[0].row.signature && row.actions === named[0].row.actions);
+      if (named.length === 1 || atSameTime || sameState) {
+        const best = named.slice().sort((a, b) => b.row.savedAt - a.row.savedAt || a.distance - b.distance)[0];
+        return { kind: 'matched-save-slot', row: best.row, deltaSeconds: best.distance };
+      }
+      const exact = named.filter((r) => r.distance < 0.05);
+      if (exact.length === 1) {
+        return { kind: 'matched-save-slot-exact-time', row: exact[0].row, deltaSeconds: exact[0].distance };
+      }
+      return { kind: 'ambiguous-save-slot', row: null, candidates: named.length };
+    }
     const best = near[0];
     const conflicting = near.some(({ row }) => row.id !== best.row.id
       && (row.signature !== best.row.signature || row.actions !== best.row.actions));
@@ -550,7 +565,7 @@
     }
     return String(h >>> 0);
   }
-  async function writeSimulationCheckpoint(saveEventAt, snapshot) {
+  async function writeSimulationCheckpoint(saveEventAt, snapshot, saveName = null, city = null) {
     const elapsed = gameElapsedForCheckpoint();
     if (elapsed == null) {
       return false;
@@ -560,10 +575,12 @@
     if (!key || !indexKey) return false;
     const signature = ledgerSnapshotSignature(snapshot);
     const row = { id, elapsed, savedAt: saveEventAt,
-      actions: snapshot.actions?.length || 0, signature };
+      actions: snapshot.actions?.length || 0, signature,
+      saveName: typeof saveName === "string" && saveName.length ? saveName : null,
+      city: city || null };
     const savedSnapshot = { ...compactStoredLedger(snapshot),
       version: Number(snapshot.version) || 7, gameElapsed: elapsed,
-      checkpointId: id, savedAt: nextLedgerTimestamp() };
+      checkpointId: id, savedAt: nextLedgerTimestamp(), city: city || null };
     writeLocalLedgerNow(key, JSON.stringify(savedSnapshot));
     if (checkpointIndexCacheKey !== indexKey) { checkpointIndexCache = null; checkpointIndexCacheKey = indexKey; }
     let previous = checkpointIndexCache;
@@ -828,11 +845,12 @@
     let checkpointSourceKey = null;
     const indexRows = sawGameLoadedHook ? await readCheckpointIndex() : [];
     const elapsed = gameElapsedForCheckpoint();
-    const match = selectCheckpointAtGameTime(indexRows, elapsed);
+    const match = selectCheckpointAtGameTime(indexRows, elapsed, currentSaveName, currentCity());
     if (match.row) {
       const candidateKey = checkpointDataKey(match.row.id);
       const candidate = candidateKey ? await readBestStoredLedger(candidateKey) : null;
       if (candidate?.state?.checkpointId === match.row.id
+        && (!candidate.state.city || candidate.state.city === currentCity())
         && candidate.state.gameElapsed != null
         && Math.abs(Number(candidate.state.gameElapsed) - elapsed) <= CHECKPOINT_MATCH_TOLERANCE_SECONDS) {
         stored = candidate;
@@ -861,6 +879,11 @@
 
         }
       }
+    }
+    if (!stored && sawGameLoadedHook && !autosaveSlotName(currentSaveName) &&
+      (match.kind === 'ambiguous-paused-save' || match.kind === 'ambiguous-save-slot')) {
+      console.warn(`${TAG} Multiple saved development checkpoints match this game state; refusing to overwrite them.`);
+      return { found: false, ambiguousCheckpoint: true, migratedSessionLedger: false, needsLegacyRepair: false };
     }
     if (!stored && !indexRows.length && currentSaveName != null && !autosaveSlotName(currentSaveName)) {
       const legacyKey = ledgerKeyForSaveName(currentSaveName);
@@ -9107,6 +9130,11 @@
       return false;
     }
 
+    if (loadResult?.ambiguousCheckpoint) {
+      demandReady = false;
+      uiStore.set({ status: "Multiple development checkpoints match this save. No changes were restored; keep your existing saves and try loading a different checkpoint." });
+      return false;
+    }
     const dd = api.gameState.getDemandData?.();
     if (!dd?.points || !dd?.popsMap) {
       return false;
@@ -9200,7 +9228,7 @@
       console.warn(`${TAG} game save has no identifiable name; checkpointing by session instead.`);
     }
     const snapshot = cloneLedgerState();
-    const saved = await writeSimulationCheckpoint(saveEventAt, snapshot);
+    const saved = await writeSimulationCheckpoint(saveEventAt, snapshot, savedSlotName, city);
     if (!saved) {
       console.warn(`${TAG} Failed to persist development changes.`);
       if (epoch === lifecycleEpoch && city === currentCity() && key === loadedLedgerKey)
